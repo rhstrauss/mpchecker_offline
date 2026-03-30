@@ -25,22 +25,18 @@ Optional but recommended:
 
 ## Installation
 
-### 1. Create the conda environment
+### 1. Clone and create the environment
 
 ```bash
-conda create -n mpchecker -c conda-forge python=3.11 openorb spiceypy numba numpy astropy astroquery requests tqdm
+git clone https://github.com/rhstrauss/mpchecker_offline.git
+cd mpchecker_offline
+conda env create -f environment.yml
 conda activate mpchecker
 ```
 
+This installs all dependencies (including pyoorb and SpiceyPy) and the `mpchecker` command in one step.
+
 If `openorb` is not available on your platform via conda-forge, see the [pyoorb build instructions](https://github.com/oorb/oorb).
-
-### 2. Install the package
-
-```bash
-git clone https://github.com/rhstrauss/mpchecker.git
-cd mpchecker
-pip install -e .
-```
 
 ### 3. Set the data directory (optional)
 
