@@ -38,17 +38,17 @@ This installs all dependencies (including pyoorb and SpiceyPy) and the `mpchecke
 
 If `openorb` is not available on your platform via conda-forge, see the [pyoorb build instructions](https://github.com/oorb/oorb).
 
-### 3. Set the data directory (optional)
+### 2. Set the data directory (optional)
 
-By default, data files are stored in `/gscratch/astro/rstrau/mpchecker_data/`. To use a different location:
+By default, data files are stored in `~/mpchecker_data/` (~800 MB). To use a different location:
 
 ```bash
 export MPCHECKER_DATA=/path/to/your/data
 ```
 
-Add this to your shell profile or conda activation script to make it permanent.
+Add this to your shell profile or conda activation script to make it permanent. On shared HPC systems, point this at a scratch or project directory to avoid filling your home quota.
 
-### 4. Download data files (~800 MB total)
+### 3. Download data files
 
 ```bash
 # All-in-one:
@@ -71,12 +71,12 @@ This downloads:
 | `naif0012.tls`, `pck00011.tpc` | <1 MB | NAIF/JPL |
 | Satellite SPK files | ~500 MB | NAIF/JPL |
 
-### 5. Pre-parse the asteroid catalog (recommended)
+### 4. Pre-parse the asteroid catalog (recommended)
 
 Parsing 1.5 M MPCORB entries on first run takes ~30 s. Cache it ahead of time:
 
 ```bash
-conda run -n mpchecker python -c "from mpchecker.mpcorb import load_mpcorb; load_mpcorb()"
+python -c "from mpchecker.mpcorb import load_mpcorb; load_mpcorb()"
 ```
 
 Subsequent runs load the pre-parsed numpy binary in ~1 s.
@@ -121,10 +121,10 @@ mpchecker obs.txt --no-satellites     # skip satellite checks
 The first `mpchecker` run loads ~1.5 M orbits and builds SPICE/pyoorb state — roughly 10–15 s. The daemon keeps everything in memory:
 
 ```bash
-mpchecker --start-daemon     # fork daemon into background
-mpchecker obs.txt            # instantly uses running daemon
-mpchecker --stop-daemon      # stop daemon
-mpchecker --serve            # foreground server (debugging)
+mpchecker --start-daemon       # fork daemon into background
+mpchecker obs.txt              # instantly uses running daemon
+mpchecker --stop-daemon        # stop daemon
+mpchecker --serve              # foreground server (debugging)
 mpchecker obs.txt --no-daemon  # bypass daemon, run standalone
 ```
 
@@ -175,6 +175,12 @@ On nodes with many CPUs (e.g. Hyak/Klone login nodes with 384 cores), Numba's de
 
 ```bash
 export NUMBA_NUM_THREADS=4
+```
+
+Set `MPCHECKER_DATA` to a scratch or project directory to avoid filling your home quota:
+
+```bash
+export MPCHECKER_DATA=/gscratch/your-group/your-username/mpchecker_data
 ```
 
 The `--workers N` flag uses `fork`-based multiprocessing, which is incompatible with Numba's TBB thread pool. Worker processes automatically fall back to the NumPy propagation path.

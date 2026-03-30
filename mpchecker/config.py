@@ -4,8 +4,8 @@ Configuration and data paths for mpchecker.
 import os
 from pathlib import Path
 
-# Default data directory: use gscratch to avoid home quota
-_DEFAULT_DATA = Path('/gscratch/astro/rstrau/mpchecker_data')
+# Default data directory (~800 MB; override via $MPCHECKER_DATA)
+_DEFAULT_DATA = Path.home() / 'mpchecker_data'
 DATA_DIR = Path(os.environ.get('MPCHECKER_DATA', _DEFAULT_DATA))
 
 # Subdirectories
