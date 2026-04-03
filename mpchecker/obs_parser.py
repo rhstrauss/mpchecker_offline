@@ -1,25 +1,20 @@
 """
-Parse MPC 80-column astrometric observation records.
+Parse astrometric observation records in multiple formats:
 
-Format: https://www.minorplanetcenter.net/iau/info/OpticalObs.html
+1. MPC 80-column format (default)
+   https://www.minorplanetcenter.net/iau/info/OpticalObs.html
 
-Column layout (1-indexed per MPC spec):
-  1-5   Packed minor planet number
-  6-12  Packed provisional/temporary designation
-  13    Discovery asterisk
-  14    Note 1
-  15    Note 2 (C=CCD, V=video, etc.)
-  16-32 Date UT: "YYYY MM DD.dddddd"
-  33-44 RA J2000: "HH MM SS.ddd"
-  45-56 Dec J2000: "sDD MM SS.dd"
-  57-65 Blank
-  66-71 Magnitude + band
-  72-77 Blank
-  78-80 Observatory code
+2. ADES PSV (pipe-separated values)
+   https://minorplanetcenter.net/iau/info/ADES.html
+
+3. hldet (HelioLinC detection CSV, e.g. parseout.csv)
+   Comma-separated with columns for MJD, RA, Dec, mag, band, obscode, etc.
 """
 
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
+import csv
+import io
 import re
 
 
@@ -305,6 +300,364 @@ def parse_observations(text: str) -> List[Observation]:
 
 
 def parse_file(path: str) -> List[Observation]:
-    """Parse observations from a file."""
+    """Parse MPC 80-column observations from a file."""
     with open(path, 'r', errors='replace') as f:
         return parse_observations(f.read())
+
+
+# ---------------------------------------------------------------------------
+# ADES PSV format parser
+# ---------------------------------------------------------------------------
+
+def _parse_ades_obstime(obstime: str) -> float:
+    """Parse ADES obsTime (ISO 8601) to MJD UTC.
+
+    Accepts formats like:
+      2024-01-15T12:34:56.789Z
+      2024-01-15T12:34:56Z
+      2024-01-15T12:34:56
+    """
+    s = obstime.strip().rstrip('Z')
+    # Split date and time
+    if 'T' in s:
+        date_part, time_part = s.split('T', 1)
+    else:
+        date_part = s
+        time_part = '00:00:00'
+
+    parts = date_part.split('-')
+    year = int(parts[0])
+    month = int(parts[1])
+    day = int(parts[2])
+
+    time_parts = time_part.split(':')
+    hour = int(time_parts[0])
+    minute = int(time_parts[1]) if len(time_parts) > 1 else 0
+    sec = float(time_parts[2]) if len(time_parts) > 2 else 0.0
+
+    frac_day = (hour + minute / 60.0 + sec / 3600.0) / 24.0
+
+    # JDN formula
+    a = (14 - month) // 12
+    y = year + 4800 - a
+    m = month + 12 * a - 3
+    jdn = day + (153 * m + 2) // 5 + 365 * y + y // 4 - y // 100 + y // 400 - 32045
+    jd = jdn + frac_day - 0.5
+    return jd - 2400000.5
+
+
+def parse_ades_psv(text: str) -> List[Observation]:
+    """Parse observations from ADES PSV (pipe-separated values) text.
+
+    ADES PSV files have metadata lines starting with # or !, and data lines
+    with pipe-separated fields.  The header row defines column names.
+    """
+    obs = []
+    lines = text.splitlines()
+
+    # Find the header row (first line with pipes that isn't a comment)
+    header_idx = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#') or stripped.startswith('!'):
+            continue
+        if '|' in stripped:
+            header_idx = i
+            break
+
+    if header_idx is None:
+        return obs
+
+    # Parse header
+    header_line = lines[header_idx]
+    columns = [c.strip() for c in header_line.split('|')]
+
+    # Build column index
+    col_idx = {}
+    for j, name in enumerate(columns):
+        col_idx[name] = j
+
+    # Required columns
+    required = {'obsTime', 'ra', 'dec', 'stn'}
+    if not required.issubset(col_idx.keys()):
+        # Try alternate column names
+        alt_map = {'stn': 'mpcCode', 'obsTime': 'obsTime'}
+        for req_col in list(required):
+            if req_col not in col_idx:
+                for alt in alt_map.get(req_col, []):
+                    if alt in col_idx:
+                        col_idx[req_col] = col_idx[alt]
+                        break
+        if not required.issubset(col_idx.keys()):
+            return obs
+
+    for i in range(header_idx + 1, len(lines)):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#') or stripped.startswith('!'):
+            continue
+        if '|' not in stripped:
+            continue
+
+        fields = [f.strip() for f in line.split('|')]
+        if len(fields) < len(columns):
+            fields.extend([''] * (len(columns) - len(fields)))
+
+        def _get(name: str) -> str:
+            idx = col_idx.get(name)
+            if idx is not None and idx < len(fields):
+                return fields[idx].strip()
+            return ''
+
+        obstime_s = _get('obsTime')
+        ra_s = _get('ra')
+        dec_s = _get('dec')
+        stn = _get('stn')
+
+        if not obstime_s or not ra_s or not dec_s:
+            continue
+
+        try:
+            epoch_mjd = _parse_ades_obstime(obstime_s)
+            ra_deg = float(ra_s)
+            dec_deg = float(dec_s)
+        except (ValueError, IndexError):
+            continue
+
+        if not stn:
+            stn = '500'
+
+        # Magnitude
+        mag: Optional[float] = None
+        band: Optional[str] = None
+        mag_s = _get('mag')
+        if mag_s:
+            try:
+                mag = float(mag_s)
+            except ValueError:
+                pass
+        band_s = _get('band')
+        if band_s:
+            band = band_s
+
+        # Designation
+        perm_id = _get('permID')
+        prov_id = _get('provID')
+        trk_sub = _get('trkSub')
+        designation = perm_id or prov_id or trk_sub or ''
+
+        # Mode -> note2
+        mode = _get('mode')
+
+        obs.append(Observation(
+            line=line,
+            designation=designation,
+            packed_desig=perm_id or prov_id or '',
+            discovery=False,
+            note1='',
+            note2=mode or '',
+            epoch_mjd=epoch_mjd,
+            ra_deg=ra_deg,
+            dec_deg=dec_deg,
+            mag=mag,
+            band=band,
+            obscode=stn,
+            obj_type='minor_planet',
+        ))
+
+    return obs
+
+
+def parse_ades_file(path: str) -> List[Observation]:
+    """Parse ADES PSV observations from a file."""
+    with open(path, 'r', errors='replace') as f:
+        return parse_ades_psv(f.read())
+
+
+# ---------------------------------------------------------------------------
+# hldet (HelioLinC detection CSV) parser
+# ---------------------------------------------------------------------------
+
+# Common column name aliases for hldet CSV files
+_HLDET_ALIASES = {
+    'mjd': ['MJD', 'mjd', 'FieldMJD', 'fieldMJD', 'obsMJD', 'epoch_mjd',
+            'JD', 'jd'],  # JD handled with offset
+    'ra': ['RA', 'ra', 'RAdeg', 'ra_deg', 'AstRA(deg)', 'meanRA'],
+    'dec': ['Dec', 'dec', 'DEC', 'Decdeg', 'dec_deg', 'AstDec(deg)', 'meanDec'],
+    'mag': ['mag', 'Mag', 'VMag', 'Vmag', 'trailedSourceMag', 'PSFMag',
+            'magV', 'filt_mag', 'ApMag', 'flux'],
+    'band': ['band', 'Band', 'filt', 'filter', 'Filter', 'optFilter'],
+    'obscode': ['obscode', 'obsCode', 'stn', 'observatory', 'Observatory',
+                'MPC', 'mpcCode'],
+    'objid': ['objID', 'ObjID', 'object_id', 'clusterID', 'trackletID',
+              'ssObjectId', 'det_id', 'detID', 'Name', 'name',
+              'provID', 'designation'],
+}
+
+
+def _resolve_hldet_columns(header: List[str]) -> dict:
+    """Map canonical column names to indices using alias lookup."""
+    mapping = {}
+    for canonical, aliases in _HLDET_ALIASES.items():
+        for alias in aliases:
+            if alias in header:
+                mapping[canonical] = header.index(alias)
+                break
+    return mapping
+
+
+def parse_hldet(text: str) -> List[Observation]:
+    """Parse observations from HelioLinC detection CSV (hldet) text.
+
+    Expects a CSV with a header row.  Columns are matched flexibly using
+    common aliases (e.g. 'RA', 'ra', 'RAdeg' all map to right ascension).
+    At minimum needs MJD/epoch, RA, and Dec columns.
+    """
+    obs = []
+    reader = csv.reader(io.StringIO(text))
+
+    try:
+        header = next(reader)
+    except StopIteration:
+        return obs
+
+    # Strip whitespace from header names
+    header = [h.strip() for h in header]
+    col = _resolve_hldet_columns(header)
+
+    if 'mjd' not in col or 'ra' not in col or 'dec' not in col:
+        return obs
+
+    # Check if the "mjd" column is actually JD (heuristic: alias was 'JD'/'jd')
+    mjd_alias = header[col['mjd']]
+    is_jd = mjd_alias.lower() == 'jd'
+
+    for row in reader:
+        if not row or not row[0].strip():
+            continue
+        # Skip comment rows
+        if row[0].strip().startswith('#'):
+            continue
+
+        try:
+            epoch_val = float(row[col['mjd']].strip())
+            if is_jd:
+                epoch_val = epoch_val - 2400000.5  # JD → MJD
+            ra_deg = float(row[col['ra']].strip())
+            dec_deg = float(row[col['dec']].strip())
+        except (ValueError, IndexError):
+            continue
+
+        # Optional fields
+        mag: Optional[float] = None
+        band: Optional[str] = None
+        obscode = '500'
+        designation = ''
+
+        if 'mag' in col:
+            try:
+                mag = float(row[col['mag']].strip())
+            except (ValueError, IndexError):
+                pass
+        if 'band' in col:
+            try:
+                band = row[col['band']].strip() or None
+            except IndexError:
+                pass
+        if 'obscode' in col:
+            try:
+                obscode = row[col['obscode']].strip() or '500'
+            except IndexError:
+                pass
+        if 'objid' in col:
+            try:
+                designation = row[col['objid']].strip()
+            except IndexError:
+                pass
+
+        obs.append(Observation(
+            line=','.join(row),
+            designation=designation,
+            packed_desig='',
+            discovery=False,
+            note1='',
+            note2='CCD',
+            epoch_mjd=epoch_val,
+            ra_deg=ra_deg,
+            dec_deg=dec_deg,
+            mag=mag,
+            band=band,
+            obscode=obscode,
+            obj_type='minor_planet',
+        ))
+
+    return obs
+
+
+def parse_hldet_file(path: str) -> List[Observation]:
+    """Parse HelioLinC detection CSV observations from a file."""
+    with open(path, 'r', errors='replace') as f:
+        return parse_hldet(f.read())
+
+
+# ---------------------------------------------------------------------------
+# Format auto-detection
+# ---------------------------------------------------------------------------
+
+def detect_format(text: str) -> str:
+    """Auto-detect observation file format from content.
+
+    Returns one of: 'mpc80', 'ades', 'hldet'
+    """
+    lines = text.splitlines()
+
+    for line in lines[:30]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # ADES PSV metadata markers
+        if stripped.startswith('# version=') or stripped.startswith('! mpcCode'):
+            return 'ades'
+        # ADES pipe-separated header row
+        if '|' in stripped and any(kw in stripped for kw in
+                                   ('obsTime', 'permID', 'provID', 'trkSub')):
+            return 'ades'
+
+    # Check for CSV with recognized header
+    for line in lines[:5]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        if ',' in stripped:
+            cols = [c.strip() for c in stripped.split(',')]
+            # Check for hldet-like column names
+            col_lower = {c.lower() for c in cols}
+            if ('ra' in col_lower or 'radeg' in col_lower) and \
+               ('dec' in col_lower or 'decdeg' in col_lower):
+                return 'hldet'
+            # Also match on specific hldet aliases
+            all_aliases = set()
+            for aliases in _HLDET_ALIASES.values():
+                all_aliases.update(aliases)
+            if len(set(cols) & all_aliases) >= 3:
+                return 'hldet'
+
+    # Default to MPC 80-column
+    return 'mpc80'
+
+
+def parse_auto(text: str) -> List[Observation]:
+    """Auto-detect format and parse observations."""
+    fmt = detect_format(text)
+    if fmt == 'ades':
+        return parse_ades_psv(text)
+    elif fmt == 'hldet':
+        return parse_hldet(text)
+    else:
+        return parse_observations(text)
+
+
+def parse_file_auto(path: str) -> List[Observation]:
+    """Auto-detect format and parse observations from a file."""
+    with open(path, 'r', errors='replace') as f:
+        return parse_auto(f.read())
