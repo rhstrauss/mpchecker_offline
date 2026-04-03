@@ -529,15 +529,39 @@ def phase_angle(obj_helio: np.ndarray,
 _OORB_INIT = False
 
 
+def _sync_obscodes(src: 'Path', dst: 'Path') -> None:
+    """Copy our MPC ObsCodes file into pyoorb's data directory if newer.
+
+    This ensures pyoorb recognises recently-added observatory codes
+    (e.g. M22, W68) that may be missing from the version bundled with
+    the conda openorb package.
+    """
+    import shutil
+    if not src.exists():
+        return
+    # Skip if dst is already up to date
+    if dst.exists():
+        if src.stat().st_mtime <= dst.stat().st_mtime:
+            return
+    try:
+        shutil.copy2(src, dst)
+        log.info('Synced ObsCodes %s → %s', src, dst)
+    except OSError as exc:
+        log.warning('Could not sync ObsCodes to pyoorb data dir: %s', exc)
+
+
 def _init_oorb():
     global _OORB_INIT
     if _OORB_INIT:
         return
     import pyoorb as oo
-    from .config import OORB_EPHEM
+    from .config import OORB_EPHEM, OORB_DATA, OBSCODE_FILE
     ephem = str(OORB_EPHEM)
     if not os.path.exists(ephem):
         raise FileNotFoundError(f'pyoorb ephemeris not found: {ephem}')
+    # Sync our (newer) MPC ObsCodes into pyoorb's data directory so that
+    # recently-added observatory codes are available for ephemeris calls.
+    _sync_obscodes(OBSCODE_FILE, OORB_DATA / 'OBSCODE.dat')
     oo.pyoorb.oorb_init(ephem)
     _OORB_INIT = True
     log.info('pyoorb initialized with %s', ephem)
@@ -638,7 +662,8 @@ def oorb_ephemeris(
 
     # Non-zero error: fall back to processing orbits one-by-one to identify
     # and skip problematic objects. Returns NaN rows for failures.
-    log.debug('pyoorb batch error %d; retrying %d orbits individually', err, n)
+    log.warning('pyoorb batch error %d for obscode %r; retrying %d orbits individually',
+                err, obscode, n)
     result = np.full((n, 11), np.nan)
     result[:, 9] = 99.0   # default V-mag = 99 (marks failure)
     for j in range(n):
@@ -654,6 +679,21 @@ def oorb_ephemeris(
                 result[j] = e2[0, 0]
         except Exception:
             pass
+
+    # If ALL objects failed, the obscode is likely unrecognised by pyoorb.
+    # Retry with geocenter ('500') — parallax error is <1" for main-belt.
+    if np.all(result[:, 9] >= 90.0) and obscode != '500':
+        log.warning('All orbits failed for obscode %r — retrying with geocenter '
+                    '(500). Topocentric correction skipped.', obscode)
+        eph_geo, err_geo = oo.pyoorb.oorb_ephemeris_basic(
+            in_orbits=orbits,
+            in_obscode='500 ',
+            in_date_ephems=epochs,
+            in_dynmodel=dynmodel,
+        )
+        if err_geo == 0:
+            result = eph_geo[:, 0, :]
+
     return result
 
 
@@ -685,6 +725,8 @@ def oorb_ephemeris_multi_epoch(
         return eph  # [n_orbits, n_epochs, 11]
 
     # Non-zero error: fall back to per-object retry
+    log.warning('pyoorb multi-epoch batch error %d for obscode %r; retrying %d orbits individually',
+                err, obscode, len(orbits))
     n = len(orbits)
     result = np.full((n, n_epochs, 11), np.nan)
     result[:, :, 9] = 99.0
@@ -701,6 +743,21 @@ def oorb_ephemeris_multi_epoch(
                 result[j] = e2[0]
         except Exception:
             pass
+
+    # If ALL objects failed, the obscode is likely unrecognised by pyoorb.
+    # Retry with geocenter ('500') — parallax error is <1" for main-belt.
+    if np.all(result[:, :, 9] >= 90.0) and obscode != '500':
+        log.warning('All orbits failed for obscode %r — retrying with geocenter '
+                    '(500). Topocentric correction skipped.', obscode)
+        eph_geo, err_geo = oo.pyoorb.oorb_ephemeris_basic(
+            in_orbits=orbits,
+            in_obscode='500 ',
+            in_date_ephems=epochs,
+            in_dynmodel=dynmodel,
+        )
+        if err_geo == 0:
+            result = eph_geo
+
     return result
 
 

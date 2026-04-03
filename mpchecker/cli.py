@@ -3,8 +3,19 @@ Command-line interface for local mpchecker.
 
 Usage examples:
 
-  # Check an 80-column obs file
+  # Check an 80-column obs file (format auto-detected)
   mpchecker obs.txt
+
+  # Check an ADES PSV file
+  mpchecker observations.psv --format ades
+
+  # Check a HelioLinC detection CSV (parseout.csv)
+  mpchecker parseout.csv --format hldet
+
+  # Check multiple files at once (globs supported)
+  mpchecker night1.txt night2.txt night3.txt
+  mpchecker obs_*.txt
+  mpchecker data/**/*.csv --format hldet
 
   # Check with custom search radius and magnitude limit
   mpchecker obs.txt --radius 15 --maglim 22
@@ -24,6 +35,7 @@ Usage examples:
 """
 
 import argparse
+import glob
 import logging
 import sys
 from pathlib import Path
@@ -174,8 +186,14 @@ def main(argv=None):
     )
 
     # Input
-    parser.add_argument('obsfile', nargs='?',
-                        help='MPC 80-column observation file (or - for stdin)')
+    parser.add_argument('obsfile', nargs='*',
+                        help='Observation file(s) to check.  Accepts multiple files, '
+                             'shell globs (e.g. "obs_*.txt"), and - for stdin.')
+    parser.add_argument('--format', '-f', dest='fmt',
+                        choices=['auto', 'mpc80', 'ades', 'hldet'],
+                        default='auto',
+                        help='Input format: auto (default), mpc80 (MPC 80-column), '
+                             'ades (ADES PSV), hldet (HelioLinC detection CSV)')
     parser.add_argument('--ra',      type=float, metavar='DEG',
                         help='RA of target (degrees J2000)')
     parser.add_argument('--dec',     type=float, metavar='DEG',
@@ -314,16 +332,54 @@ def main(argv=None):
         return 0
 
     # Build observations
-    from .obs_parser import parse_observations, parse_file, Observation
+    from .obs_parser import (parse_observations, parse_file, Observation,
+                             parse_ades_psv, parse_ades_file,
+                             parse_hldet, parse_hldet_file,
+                             parse_auto, parse_file_auto)
+
+    # Select parser based on --format
+    _parsers = {
+        'mpc80': (parse_observations, parse_file),
+        'ades':  (parse_ades_psv,     parse_ades_file),
+        'hldet': (parse_hldet,        parse_hldet_file),
+        'auto':  (parse_auto,         parse_file_auto),
+    }
+    parse_text_fn, parse_file_fn = _parsers[args.fmt]
 
     observations = []
 
     if args.obsfile:
-        if args.obsfile == '-':
+        # Expand globs and collect all file paths
+        resolved_paths = []
+        read_stdin = False
+        for pattern in args.obsfile:
+            if pattern == '-':
+                read_stdin = True
+            else:
+                expanded = sorted(glob.glob(pattern))
+                if not expanded:
+                    # No glob match — treat as literal path (will error naturally)
+                    resolved_paths.append(pattern)
+                else:
+                    resolved_paths.extend(expanded)
+
+        if read_stdin:
             text = sys.stdin.read()
-            observations = parse_observations(text)
-        else:
-            observations = parse_file(args.obsfile)
+            observations.extend(parse_text_fn(text))
+
+        for fpath in resolved_paths:
+            try:
+                observations.extend(parse_file_fn(fpath))
+            except FileNotFoundError:
+                print(f'WARNING: file not found: {fpath}', file=sys.stderr)
+            except Exception as exc:
+                print(f'WARNING: error reading {fpath}: {exc}', file=sys.stderr)
+
+        if resolved_paths and not read_stdin:
+            n_files = len(resolved_paths)
+            if n_files > 1:
+                print(f'Read {n_files} files, {len(observations)} observation(s) total.',
+                      file=sys.stderr)
     elif args.ra is not None and args.dec is not None and args.epoch is not None:
         # Single RA/Dec/epoch check — synthesize a dummy observation
         from .obs_parser import Observation as Obs
@@ -415,6 +471,12 @@ def main(argv=None):
         except Exception:
             pass
 
+    print(f'Loaded {len(asteroids)} asteroids, {len(comets)} comets.',
+          file=sys.stderr)
+    if len(asteroids) == 0 and not args.no_asteroids:
+        print('WARNING: No asteroids loaded — run "mpchecker --download-data" '
+              'or check --maglim setting.', file=sys.stderr)
+
     # Try to load a cached sky index for fast candidate lookup
     sky_index = None
     if not args.no_asteroids and len(asteroids) > 0:
@@ -444,6 +506,7 @@ def main(argv=None):
 
     # Format and output
     output = format_results(results, args.radius)
+    total_matches = sum(len(r.matches) for r in results)
 
     if args.output:
         with open(args.output, 'w') as f:
@@ -451,6 +514,10 @@ def main(argv=None):
         print(f'Results written to {args.output}', file=sys.stderr)
     else:
         print(output)
+
+    if total_matches == 0 and len(asteroids) > 0:
+        print('Hint: 0 matches found. Run with --debug for pipeline diagnostics.',
+              file=sys.stderr)
 
     return 0
 
