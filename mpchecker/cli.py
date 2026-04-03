@@ -471,6 +471,12 @@ def main(argv=None):
         except Exception:
             pass
 
+    print(f'Loaded {len(asteroids)} asteroids, {len(comets)} comets.',
+          file=sys.stderr)
+    if len(asteroids) == 0 and not args.no_asteroids:
+        print('WARNING: No asteroids loaded — run "mpchecker --download-data" '
+              'or check --maglim setting.', file=sys.stderr)
+
     # Try to load a cached sky index for fast candidate lookup
     sky_index = None
     if not args.no_asteroids and len(asteroids) > 0:
@@ -500,6 +506,7 @@ def main(argv=None):
 
     # Format and output
     output = format_results(results, args.radius)
+    total_matches = sum(len(r.matches) for r in results)
 
     if args.output:
         with open(args.output, 'w') as f:
@@ -507,6 +514,10 @@ def main(argv=None):
         print(f'Results written to {args.output}', file=sys.stderr)
     else:
         print(output)
+
+    if total_matches == 0 and len(asteroids) > 0:
+        print('Hint: 0 matches found. Run with --debug for pipeline diagnostics.',
+              file=sys.stderr)
 
     return 0
 
