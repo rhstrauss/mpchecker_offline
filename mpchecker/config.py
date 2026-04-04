@@ -9,9 +9,10 @@ _DEFAULT_DATA = Path.home() / 'mpchecker_data'
 DATA_DIR = Path(os.environ.get('MPCHECKER_DATA', _DEFAULT_DATA))
 
 # Subdirectories
-ORBS_DIR = DATA_DIR / 'orbits'
-SPICE_DIR = DATA_DIR / 'spice'
-CACHE_DIR = DATA_DIR / 'cache'
+ORBS_DIR    = DATA_DIR / 'orbits'
+SPICE_DIR   = DATA_DIR / 'spice'
+CACHE_DIR   = DATA_DIR / 'cache'
+FO_CACHE_DIR = CACHE_DIR / 'fo_fits'   # fo orbit-refit JSON cache
 
 # Orbit files
 MPCORB_FILE = ORBS_DIR / 'MPCORB.DAT'

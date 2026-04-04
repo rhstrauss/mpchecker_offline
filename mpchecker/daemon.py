@@ -29,6 +29,7 @@ import socket
 import struct
 import sys
 from pathlib import Path
+from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ def _send_msg(sock: socket.socket, data: bytes) -> None:
 def serve(
     mag_limit: float = 25.0,
     n_workers: int = 1,
+    mpcat_dir: Optional[Path] = None,
 ) -> None:
     """
     Start the daemon server (blocking).
@@ -93,8 +95,9 @@ def serve(
 
     Parameters
     ----------
-    mag_limit : faint limit used when loading the asteroid catalog
-    n_workers : parallel workers forwarded to check_observations
+    mag_limit  : faint limit used when loading the asteroid catalog
+    n_workers  : parallel workers forwarded to check_observations
+    mpcat_dir  : if provided, load MPCATIndex for fo orbit refitting
     """
     from .mpcorb import load_mpcorb, load_comets, load_obscodes
     from .index import get_or_build_index
@@ -114,6 +117,16 @@ def serve(
     from astropy.time import Time
     sky_index = get_or_build_index(asteroids, obscodes, CACHE_DIR,
                                    t_now_mjd=Time.now().mjd)
+
+    mpcat_index = None
+    if mpcat_dir is not None:
+        try:
+            from .mpcat import MPCATIndex
+            mpcat_index = MPCATIndex(mpcat_dir)
+            print(f'[daemon] MPCAT index loaded from {mpcat_dir}', flush=True)
+        except Exception as exc:
+            print(f'[daemon] WARNING: could not load MPCAT index: {exc}', flush=True)
+
     print('[daemon] Ready — listening on', _sock_path(), flush=True)
 
     # Set up listening socket
@@ -148,7 +161,8 @@ def serve(
         except OSError:
             break
         try:
-            _handle_client(conn, asteroids, comets, obscodes, sky_index, n_workers)
+            _handle_client(conn, asteroids, comets, obscodes, sky_index,
+                           n_workers, mpcat_index)
         except Exception as exc:
             log.warning('Error handling client: %s', exc)
         finally:
@@ -165,7 +179,8 @@ def serve(
                 log.error('Index rebuild failed: %s', exc)
 
 
-def _handle_client(conn, asteroids, comets, obscodes, sky_index, n_workers):
+def _handle_client(conn, asteroids, comets, obscodes, sky_index, n_workers,
+                   mpcat_index=None):
     data = _recv_msg(conn)
     observations, params = pickle.loads(data)
 
@@ -174,6 +189,7 @@ def _handle_client(conn, asteroids, comets, obscodes, sky_index, n_workers):
         observations, asteroids, comets, obscodes,
         sky_index=sky_index,
         n_workers=n_workers,
+        mpcat_index=mpcat_index,
         **params,
     )
     _send_msg(conn, pickle.dumps(results))
@@ -225,7 +241,8 @@ def is_daemon_running() -> bool:
 # Process management
 # ---------------------------------------------------------------------------
 
-def start_daemon_background(mag_limit: float = 25.0, n_workers: int = 1) -> int:
+def start_daemon_background(mag_limit: float = 25.0, n_workers: int = 1,
+                            mpcat_dir: Optional[Path] = None) -> int:
     """
     Fork and start the daemon in the background using the Unix double-fork
     pattern.  Returns the PID of the grandchild (the actual daemon process).
@@ -273,7 +290,7 @@ def start_daemon_background(mag_limit: float = 25.0, n_workers: int = 1) -> int:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
     try:
-        serve(mag_limit=mag_limit, n_workers=n_workers)
+        serve(mag_limit=mag_limit, n_workers=n_workers, mpcat_dir=mpcat_dir)
     except Exception as exc:
         print(f'FATAL: daemon crashed: {exc}', flush=True)
     finally:

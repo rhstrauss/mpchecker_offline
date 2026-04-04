@@ -25,7 +25,7 @@ from .obs_parser import Observation
 from .propagator import (
     kep_to_radec, ang_sep_deg, get_observer_helio, get_planet_helio,
     build_oorb_orbits_kep, build_oorb_orbits_com,
-    oorb_ephemeris_multi_epoch,
+    oorb_ephemeris_multi_epoch, reepoch_high_e_asteroids,
     _DEG2RAD, _RAD2DEG,
 )
 from .satellites import check_satellites, check_dwarf_planet_satellites
@@ -273,6 +273,24 @@ def _phase1_one_obs(
             bright_global_idx = np.where(h_mask)[0]
             ast_cands         = bright_global_idx[kep_mask]
 
+    # Wide second pass for high-eccentricity objects (close-approach NEOs).
+    # Keplerian propagation accumulates O(20') errors for NEOs at closest approach
+    # due to planetary perturbations; a wider cone catches them.  We limit this
+    # second pass to e > 0.5 (~30K objects out of 1.5M) to keep Phase 2 lean.
+    _WIDE_PREFILTER_DEG = 0.5   # 30' absolute minimum for close-approach NEOs
+    if prefilter_deg < _WIDE_PREFILTER_DEG and len(asteroids) > 0:
+        high_e_h_mask = (asteroids['H'] <= h_cut) & (asteroids['e'] > 0.5)
+        if np.any(high_e_h_mask):
+            he_indices = np.where(high_e_h_mask)[0]
+            kep_wide = _asteroid_prefilter(
+                asteroids[high_e_h_mask], obs_helio, t_tt,
+                obs.ra_deg, obs.dec_deg, _WIDE_PREFILTER_DEG)
+            extra = he_indices[kep_wide]
+            if len(extra):
+                ast_cands = np.unique(np.concatenate([ast_cands, extra]))
+                log.debug('%s: +%d high-e candidates from wide pre-filter',
+                          obs.designation, len(extra))
+
     comet_cands = np.array([], dtype=np.intp)
     if len(comets) > 0:
         comet_mask  = _comet_prefilter(
@@ -323,29 +341,46 @@ def check_observations(
     search_radius_arcmin: float = 30.0,
     mag_limit: float = 25.0,
     prefilter_factor: float = 3.0,
-    dynmodel: str = '2',
+    dynmodel: str = 'N',
     check_sats: bool = True,
     sky_index=None,
     n_workers: int = 1,
+    reepoch_threshold_days: float = 90.0,
+    mpcat_index=None,
+    fo_refit_q_threshold: float = 1.1,
+    fo_epoch_window_days: float = 5.0,
+    fo_progress: bool = False,
 ) -> List[CheckResult]:
     """
     Check each observation against the asteroid/comet catalogs and satellites.
 
     Parameters
     ----------
-    observations         : parsed input observations
-    asteroids            : structured array from mpcorb.load_mpcorb()
-    comets               : structured array from mpcorb.load_comets()
-    obscodes             : dict from mpcorb.load_obscodes()
-    search_radius_arcmin : maximum angular separation for a match
-    mag_limit            : faint limit for reported matches (approximate V)
-    prefilter_factor     : expand radius by this factor for Keplerian pre-filter
-    dynmodel             : pyoorb dynamics ('2'=two-body fast, 'N'=N-body precise)
-    check_sats           : whether to check planetary satellites
-    sky_index            : optional MultiSkyIndex (or SkyIndex) for fast candidate
-                           lookup; if None the full Keplerian prefilter is used
-    n_workers            : number of parallel worker processes for Phase 1
-                           (uses fork; >1 effective only when len(observations)>1)
+    observations           : parsed input observations
+    asteroids              : structured array from mpcorb.load_mpcorb()
+    comets                 : structured array from mpcorb.load_comets()
+    obscodes               : dict from mpcorb.load_obscodes()
+    search_radius_arcmin   : maximum angular separation for a match
+    mag_limit              : faint limit for reported matches (approximate V)
+    prefilter_factor       : expand radius by this factor for Keplerian pre-filter
+    dynmodel               : pyoorb dynamics ('2'=two-body fast, 'N'=N-body precise)
+    check_sats             : whether to check planetary satellites
+    sky_index              : optional MultiSkyIndex (or SkyIndex) for fast candidate
+                             lookup; if None the full Keplerian prefilter is used
+    n_workers              : number of parallel worker processes for Phase 1
+                             (uses fork; >1 effective only when len(observations)>1)
+    reepoch_threshold_days : if the catalog element epoch differs from the median
+                             observation epoch by more than this many days, re-epoch
+                             the high-e (e>0.5) asteroid subset via pyoorb N-body
+                             before Phase 1.  Set to 0 to disable.  Default: 90.
+    mpcat_index            : optional MPCATIndex; if provided, all objects with
+                             perihelion q < fo_refit_q_threshold are orbit-refit
+                             via fo before Phase 1, ensuring element epochs are
+                             near the observation epoch regardless of close encounters.
+    fo_refit_q_threshold   : perihelion distance threshold for fo refit (AU).
+                             All objects with q < this value are refit.  Default: 1.1.
+    fo_epoch_window_days   : cache-bin width in days for fo fits (default: 5).
+    fo_progress            : if True, log fo batch progress every 100 objects.
     """
     search_rad_deg = search_radius_arcmin / 60.0
     prefilter_deg  = search_rad_deg * prefilter_factor
@@ -359,6 +394,72 @@ def check_observations(
         _load_base_kernels()
     except Exception:
         pass
+
+    # -----------------------------------------------------------------------
+    # Pre-Phase 1a: Re-epoch high-e (e>0.5) asteroids via pyoorb N-body.
+    # Fast vectorized batch: reduces Phase 1 position errors from O(20') to
+    # < 1' for most close-approach objects by propagating to the observation
+    # epoch.  Skipped when mpcat_index is provided (fo refit in Pre-Phase 1b
+    # is more accurate and supercedes this for q < 1.1 AU objects).
+    # -----------------------------------------------------------------------
+    if (reepoch_threshold_days > 0 and len(asteroids) > 0
+            and len(observations) > 0):
+        t_tts_all = [_utc_to_tt_mjd(obs.epoch_mjd) for obs in observations]
+        obs_epoch_tt  = float(np.median(t_tts_all))
+        catalog_epoch = float(np.median(asteroids['epoch']))
+        epoch_gap     = abs(obs_epoch_tt - catalog_epoch)
+        if epoch_gap > reepoch_threshold_days:
+            log.info(
+                'Catalog epoch (MJD %.1f) is %.0f days from observations '
+                '(MJD %.1f); re-epoching high-e asteroids via %s',
+                catalog_epoch, epoch_gap, obs_epoch_tt, dynmodel,
+            )
+            from .config import CACHE_DIR
+            asteroids = reepoch_high_e_asteroids(
+                asteroids, obs_epoch_tt, dynmodel=dynmodel,
+                cache_dir=CACHE_DIR)
+
+    # -----------------------------------------------------------------------
+    # Pre-Phase 1b: fo orbit refit for all q < fo_refit_q_threshold objects.
+    #
+    # For any asteroid with perihelion inside ~1.1 AU, MPCORB elements may be
+    # from a catalog epoch on the far side of a close Earth encounter.
+    # Integrating through such an encounter accumulates errors of tens of
+    # degrees.  By refitting from scratch using MPCAT observations up to the
+    # observation date (max_date_mjd = obs epoch bin), fo produces elements at
+    # an epoch just before the observation — pyoorb then only needs to
+    # integrate a few days, eliminating close-encounter integration errors
+    # entirely.  Fit results are cached per (packed, epoch_bin); cache hits
+    # are ~1 ms.
+    # -----------------------------------------------------------------------
+    if (mpcat_index is not None
+            and fo_refit_q_threshold > 0.0
+            and len(asteroids) > 0
+            and len(observations) > 0):
+        from .orbitfit import select_neo_packed, refit_neo_batch, apply_fo_refits
+        from .config import FO_CACHE_DIR
+
+        obs_epoch_utc = float(np.median([obs.epoch_mjd for obs in observations]))
+        neo_packed = select_neo_packed(asteroids, q_threshold=fo_refit_q_threshold)
+
+        if neo_packed:
+            log.info(
+                'Pre-Phase 1 fo refit: %d objects with q < %.2f AU '
+                'at obs epoch MJD %.1f (epoch window %.0f days)',
+                len(neo_packed), fo_refit_q_threshold,
+                obs_epoch_utc, fo_epoch_window_days,
+            )
+            refits = refit_neo_batch(
+                neo_packed,
+                mpcat_index,
+                cache_dir=FO_CACHE_DIR,
+                obs_epoch_mjd=obs_epoch_utc,
+                epoch_window_days=fo_epoch_window_days,
+                progress=fo_progress,
+                n_workers=n_workers,
+            )
+            if refits:
+                asteroids = apply_fo_refits(asteroids, refits)
 
     # -----------------------------------------------------------------------
     # Phase 1: Per-observation Keplerian pre-filter — parallelised over
@@ -416,7 +517,8 @@ def check_observations(
             )
             t_tts = [obs_meta[i]['t_tt'] for i in obs_indices]
             # Single pyoorb call for all epochs in this obscode group
-            eph_batch = oorb_ephemeris_multi_epoch(orbits, t_tts, obscode, dynmodel)
+            eph_batch = oorb_ephemeris_multi_epoch(orbits, t_tts, obscode, dynmodel,
+                                                   obscodes=obscodes)
             # eph_batch: [n_union_cands, n_epochs, 11]
 
             for k, obs_i in enumerate(obs_indices):
@@ -464,7 +566,8 @@ def check_observations(
                 sub_c['Tp'], sub_c['H'], sub_c['G'],
             )
             t_tts = [obs_meta[i]['t_tt'] for i in obs_indices]
-            eph_c_batch = oorb_ephemeris_multi_epoch(orbits_c, t_tts, obscode, dynmodel)
+            eph_c_batch = oorb_ephemeris_multi_epoch(orbits_c, t_tts, obscode, dynmodel,
+                                                     obscodes=obscodes)
 
             for k, obs_i in enumerate(obs_indices):
                 my_cands_c = obs_meta[obs_i]['comet_cands']

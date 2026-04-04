@@ -472,6 +472,83 @@ def get_observer_helio(t_mjd: float,
 
 
 # ---------------------------------------------------------------------------
+# Topocentric parallax correction for pyoorb geocentric ephemerides
+# ---------------------------------------------------------------------------
+
+def _apply_topocentric_correction(
+    eph_geo: np.ndarray,
+    t_mjd_tt,
+    obscode: str,
+    obscodes: dict,
+) -> np.ndarray:
+    """
+    Shift a pyoorb geocentric ephemeris to topocentric coordinates.
+
+    pyoorb is always called with obscode '500' (geocenter) to avoid its
+    brittle OBSCODE.dat parser failing on newer MPC entries.  This function
+    applies the resulting parallax correction using the observer position
+    from get_observer_helio(), which reads our own ObsCodes.txt directly.
+
+    Parameters
+    ----------
+    eph_geo   : [n_orbits, 11] (single-epoch) or [n_orbits, n_epochs, 11]
+    t_mjd_tt  : scalar TT MJD (single-epoch) or list of TT MJDs (multi-epoch)
+    obscode   : MPC observatory code
+    obscodes  : dict from mpcorb.load_obscodes()
+
+    Columns modified: 1 (RA deg), 2 (Dec deg), 8 (delta AU).
+    All other columns (vmag, rates, r_helio, phase) are from geocentric
+    ephemeris; the corrections to those are negligible (<0.001 mag, <0.1"/hr).
+    """
+    if obscode == '500':
+        return eph_geo
+
+    single_epoch = (eph_geo.ndim == 2)
+    if single_epoch:
+        work = eph_geo[:, np.newaxis, :]   # [n, 1, 11]
+        t_list = [t_mjd_tt]
+    else:
+        work = eph_geo
+        t_list = list(t_mjd_tt)
+
+    result = work.copy()
+
+    for k, t_tt in enumerate(t_list):
+        # Observer offset from geocenter (AU, J2000 equatorial).
+        # We use TT as a proxy for UTC here; the 69-second difference
+        # introduces a position error of ~1e-8 AU, which is negligible.
+        obs_helio   = get_observer_helio(t_tt, obscode, obscodes)
+        earth_helio = get_earth_helio(t_tt)
+        d = obs_helio - earth_helio
+
+        if np.allclose(d, 0.0):
+            continue   # geocenter equivalent (space telescope, etc.)
+
+        ra_rad  = result[:, k, 1] * _DEG2RAD
+        dec_rad = result[:, k, 2] * _DEG2RAD
+        delta   = result[:, k, 8]
+
+        cos_ra  = np.cos(ra_rad)
+        sin_ra  = np.sin(ra_rad)
+        cos_dec = np.cos(dec_rad)
+        sin_dec = np.sin(dec_rad)
+
+        # Topocentric parallax: angular shift (radians)
+        dra_rad  = -(d[0]*sin_ra  - d[1]*cos_ra) / (delta * cos_dec)
+        ddec_rad = -(d[0]*cos_ra*sin_dec + d[1]*sin_ra*sin_dec - d[2]*cos_dec) / delta
+
+        result[:, k, 1] += dra_rad  * _RAD2DEG
+        result[:, k, 2] += ddec_rad * _RAD2DEG
+
+        # Topocentric distance: subtract projection of observer offset onto LOS
+        result[:, k, 8] -= d[0]*cos_dec*cos_ra + d[1]*cos_dec*sin_ra + d[2]*sin_dec
+
+    if single_epoch:
+        return result[:, 0, :]
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Angular separation (vectorized)
 # ---------------------------------------------------------------------------
 
@@ -529,39 +606,15 @@ def phase_angle(obj_helio: np.ndarray,
 _OORB_INIT = False
 
 
-def _sync_obscodes(src: 'Path', dst: 'Path') -> None:
-    """Copy our MPC ObsCodes file into pyoorb's data directory if newer.
-
-    This ensures pyoorb recognises recently-added observatory codes
-    (e.g. M22, W68) that may be missing from the version bundled with
-    the conda openorb package.
-    """
-    import shutil
-    if not src.exists():
-        return
-    # Skip if dst is already up to date
-    if dst.exists():
-        if src.stat().st_mtime <= dst.stat().st_mtime:
-            return
-    try:
-        shutil.copy2(src, dst)
-        log.info('Synced ObsCodes %s → %s', src, dst)
-    except OSError as exc:
-        log.warning('Could not sync ObsCodes to pyoorb data dir: %s', exc)
-
-
 def _init_oorb():
     global _OORB_INIT
     if _OORB_INIT:
         return
     import pyoorb as oo
-    from .config import OORB_EPHEM, OORB_DATA, OBSCODE_FILE
+    from .config import OORB_EPHEM
     ephem = str(OORB_EPHEM)
     if not os.path.exists(ephem):
         raise FileNotFoundError(f'pyoorb ephemeris not found: {ephem}')
-    # Sync our (newer) MPC ObsCodes into pyoorb's data directory so that
-    # recently-added observatory codes are available for ephemeris calls.
-    _sync_obscodes(OBSCODE_FILE, OORB_DATA / 'OBSCODE.dat')
     oo.pyoorb.oorb_init(ephem)
     _OORB_INIT = True
     log.info('pyoorb initialized with %s', ephem)
@@ -630,11 +683,124 @@ def build_oorb_orbits_com(
     return orbits
 
 
+def reepoch_high_e_asteroids(
+    asteroids: np.ndarray,
+    t_target_tt: float,
+    dynmodel: str = 'N',
+    e_threshold: float = 0.5,
+    cache_dir=None,
+) -> np.ndarray:
+    """
+    Re-epoch high-eccentricity asteroids to t_target_tt via N-body integration.
+
+    Uses pyoorb.oorb_propagation to integrate the high-e subset (~30K objects)
+    from the catalog epoch to t_target_tt.  This greatly reduces Phase 1
+    Keplerian propagation errors for close-approach NEOs when the catalog
+    epoch is months away from the observation epoch.
+
+    Results are cached in cache_dir (if provided) keyed by the catalog epoch,
+    the target epoch rounded to the nearest 5 days, and the dynmodel.  The
+    cache is invalidated when MPCORB is updated (catalog epoch changes).
+
+    Returns a copy of the asteroids array with updated elements for the
+    high-e subset.  On any pyoorb failure the original array is returned
+    unchanged (the wide pre-filter in Phase 1 acts as a safety net).
+
+    Parameters
+    ----------
+    asteroids   : structured array from mpcorb.load_mpcorb()
+    t_target_tt : target epoch, MJD TT
+    dynmodel    : 'N' (N-body) or '2' (two-body); use 'N' for accuracy
+    e_threshold : eccentricity cut; default 0.5 (~30K objects in MPCORB)
+    cache_dir   : directory for caching re-epoched elements (Path or str)
+    """
+    from pathlib import Path
+
+    mask = asteroids['e'] > e_threshold
+    if not np.any(mask):
+        return asteroids
+
+    # Round target epoch to nearest 5 days for cache key
+    t_rounded = round(t_target_tt / 5.0) * 5
+    cat_epoch = int(round(float(np.median(asteroids['epoch']))))
+    n_high_e  = int(mask.sum())   # included in key so H-filtered catalogs don't collide
+
+    # ---- Try cache ----
+    cache_path = None
+    if cache_dir is not None:
+        cache_dir = Path(cache_dir)
+        cache_path = cache_dir / f'reepoch_{cat_epoch}_{t_rounded}_{dynmodel}_{n_high_e}.npz'
+        if cache_path.exists():
+            try:
+                cached = np.load(cache_path)
+                result = asteroids.copy()
+                idx = np.where(mask)[0]
+                for col in ('a', 'e', 'i', 'Omega', 'omega', 'M', 'epoch'):
+                    result[col][idx] = cached[col]
+                log.info('Loaded re-epoched high-e elements from cache: %s', cache_path.name)
+                return result
+            except Exception as exc:
+                log.warning('Re-epoch cache load failed (%s); recomputing', exc)
+
+    # ---- Compute ----
+    import pyoorb as oo
+    _init_oorb()
+
+    sub = asteroids[mask]
+    orbits = build_oorb_orbits_kep(
+        sub['a'], sub['e'],
+        sub['i']     * _DEG2RAD,
+        sub['Omega'] * _DEG2RAD,
+        sub['omega'] * _DEG2RAD,
+        sub['M']     * _DEG2RAD,
+        sub['epoch'], sub['H'], sub['G'],
+    )
+
+    epoch_arr = np.array([[t_target_tt, 3]], dtype=np.double, order='F')  # TT
+    new_orbits, err = oo.pyoorb.oorb_propagation(
+        in_orbits=orbits,
+        in_epoch=epoch_arr,
+        in_dynmodel=dynmodel,
+    )
+
+    if err != 0:
+        log.warning('pyoorb re-epoch failed (err=%d); using original elements', err)
+        return asteroids
+
+    # oorb_propagation returns angular elements (i, Omega, omega, M) in degrees
+    result = asteroids.copy()
+    idx = np.where(mask)[0]
+    result['a'][idx]     = new_orbits[:, 1]
+    result['e'][idx]     = new_orbits[:, 2]
+    result['i'][idx]     = new_orbits[:, 3]    # degrees
+    result['Omega'][idx] = new_orbits[:, 4]    # degrees
+    result['omega'][idx] = new_orbits[:, 5]    # degrees
+    result['M'][idx]     = new_orbits[:, 6]    # degrees
+    result['epoch'][idx] = t_target_tt
+
+    log.info('Re-epoched %d high-e (e>%.1f) asteroids to MJD TT %.1f',
+             len(idx), e_threshold, t_target_tt)
+
+    # ---- Save cache ----
+    if cache_path is not None:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            save = {col: result[col][idx]
+                    for col in ('a', 'e', 'i', 'Omega', 'omega', 'M', 'epoch')}
+            np.savez(cache_path, **save)
+            log.info('Saved re-epoch cache: %s', cache_path.name)
+        except Exception as exc:
+            log.warning('Re-epoch cache save failed: %s', exc)
+
+    return result
+
+
 def oorb_ephemeris(
     orbits: np.ndarray,
     t_mjd: float,
     obscode: str,
     dynmodel: str = '2',        # '2'=two-body, 'N'=N-body
+    obscodes: dict = None,
 ) -> np.ndarray:
     """
     Compute ephemerides for a batch of orbits using pyoorb.
@@ -643,6 +809,10 @@ def oorb_ephemeris(
       0: MJD, 1: RA(deg), 2: Dec(deg), 3: dRA/dt(deg/day), 4: dDec/dt(deg/day),
       5: phase angle(deg), 6: elongation(deg), 7: r_helio(AU), 8: delta(AU),
       9: V-mag, 10: position angle
+
+    pyoorb is always called with geocenter ('500') to avoid its brittle
+    OBSCODE.dat parser failing on recently-added MPC codes.  When obscodes
+    is provided the topocentric correction is applied by this function.
 
     Problem objects that pyoorb cannot integrate are returned with V-mag=99.
     """
@@ -653,17 +823,19 @@ def oorb_ephemeris(
     epochs = np.array([[t_mjd, 3]], dtype=np.double, order='F')   # TT
     eph, err = oo.pyoorb.oorb_ephemeris_basic(
         in_orbits=orbits,
-        in_obscode=obscode.ljust(4),
+        in_obscode='500 ',
         in_date_ephems=epochs,
         in_dynmodel=dynmodel,
     )
     if err == 0:
-        return eph[:, 0, :]  # [n_orbits, 11]
+        result = eph[:, 0, :]   # [n_orbits, 11]
+        if obscodes is not None:
+            result = _apply_topocentric_correction(result, t_mjd, obscode, obscodes)
+        return result
 
     # Non-zero error: fall back to processing orbits one-by-one to identify
     # and skip problematic objects. Returns NaN rows for failures.
-    log.warning('pyoorb batch error %d for obscode %r; retrying %d orbits individually',
-                err, obscode, n)
+    log.warning('pyoorb batch error %d; retrying %d orbits individually', err, n)
     result = np.full((n, 11), np.nan)
     result[:, 9] = 99.0   # default V-mag = 99 (marks failure)
     for j in range(n):
@@ -671,7 +843,7 @@ def oorb_ephemeris(
         try:
             e2, err2 = oo.pyoorb.oorb_ephemeris_basic(
                 in_orbits=single,
-                in_obscode=obscode.ljust(4),
+                in_obscode='500 ',
                 in_date_ephems=epochs,
                 in_dynmodel=dynmodel,
             )
@@ -679,21 +851,8 @@ def oorb_ephemeris(
                 result[j] = e2[0, 0]
         except Exception:
             pass
-
-    # If ALL objects failed, the obscode is likely unrecognised by pyoorb.
-    # Retry with geocenter ('500') — parallax error is <1" for main-belt.
-    if np.all(result[:, 9] >= 90.0) and obscode != '500':
-        log.warning('All orbits failed for obscode %r — retrying with geocenter '
-                    '(500). Topocentric correction skipped.', obscode)
-        eph_geo, err_geo = oo.pyoorb.oorb_ephemeris_basic(
-            in_orbits=orbits,
-            in_obscode='500 ',
-            in_date_ephems=epochs,
-            in_dynmodel=dynmodel,
-        )
-        if err_geo == 0:
-            result = eph_geo[:, 0, :]
-
+    if obscodes is not None:
+        result = _apply_topocentric_correction(result, t_mjd, obscode, obscodes)
     return result
 
 
@@ -702,12 +861,16 @@ def oorb_ephemeris_multi_epoch(
     t_mjd_list: list,
     obscode: str,
     dynmodel: str = '2',
+    obscodes: dict = None,
 ) -> np.ndarray:
     """
     Compute ephemerides for a batch of orbits at multiple epochs in one pyoorb call.
 
     Returns array of shape [n_orbits, n_epochs, 11].
     Columns same as oorb_ephemeris: MJD, RA, Dec, dRA, dDec, phase, elong, r, delta, V, PA.
+
+    pyoorb is always called with geocenter ('500'); topocentric correction is
+    applied via _apply_topocentric_correction when obscodes is provided.
     """
     import pyoorb as oo
     _init_oorb()
@@ -717,16 +880,18 @@ def oorb_ephemeris_multi_epoch(
 
     eph, err = oo.pyoorb.oorb_ephemeris_basic(
         in_orbits=orbits,
-        in_obscode=obscode.ljust(4),
+        in_obscode='500 ',
         in_date_ephems=epochs,
         in_dynmodel=dynmodel,
     )
     if err == 0:
+        if obscodes is not None:
+            eph = _apply_topocentric_correction(eph, t_mjd_list, obscode, obscodes)
         return eph  # [n_orbits, n_epochs, 11]
 
     # Non-zero error: fall back to per-object retry
-    log.warning('pyoorb multi-epoch batch error %d for obscode %r; retrying %d orbits individually',
-                err, obscode, len(orbits))
+    log.warning('pyoorb multi-epoch batch error %d; retrying %d orbits individually',
+                err, len(orbits))
     n = len(orbits)
     result = np.full((n, n_epochs, 11), np.nan)
     result[:, :, 9] = 99.0
@@ -735,7 +900,7 @@ def oorb_ephemeris_multi_epoch(
         try:
             e2, err2 = oo.pyoorb.oorb_ephemeris_basic(
                 in_orbits=single,
-                in_obscode=obscode.ljust(4),
+                in_obscode='500 ',
                 in_date_ephems=epochs,
                 in_dynmodel=dynmodel,
             )
@@ -743,21 +908,8 @@ def oorb_ephemeris_multi_epoch(
                 result[j] = e2[0]
         except Exception:
             pass
-
-    # If ALL objects failed, the obscode is likely unrecognised by pyoorb.
-    # Retry with geocenter ('500') — parallax error is <1" for main-belt.
-    if np.all(result[:, :, 9] >= 90.0) and obscode != '500':
-        log.warning('All orbits failed for obscode %r — retrying with geocenter '
-                    '(500). Topocentric correction skipped.', obscode)
-        eph_geo, err_geo = oo.pyoorb.oorb_ephemeris_basic(
-            in_orbits=orbits,
-            in_obscode='500 ',
-            in_date_ephems=epochs,
-            in_dynmodel=dynmodel,
-        )
-        if err_geo == 0:
-            result = eph_geo
-
+    if obscodes is not None:
+        result = _apply_topocentric_correction(result, t_mjd_list, obscode, obscodes)
     return result
 
 

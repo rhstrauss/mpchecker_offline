@@ -210,8 +210,8 @@ def main(argv=None):
                         help='Faint magnitude limit (default: 25)')
 
     # Dynamics
-    parser.add_argument('--dynmodel', choices=['N', '2'], default='2',
-                        help='pyoorb dynamics: 2=two-body (default, fast), N=N-body (precise)')
+    parser.add_argument('--dynmodel', choices=['N', '2'], default='N',
+                        help='pyoorb dynamics: N=N-body (default, precise), 2=two-body (faster)')
     parser.add_argument('--workers', type=int, default=1, metavar='N',
                         help='Parallel workers for Keplerian pre-filter phase (default: 1; '
                              'try 8 on HPC nodes for large obs batches)')
@@ -246,6 +246,19 @@ def main(argv=None):
     parser.add_argument('--data-dir', type=Path, metavar='DIR',
                         help='Override data directory (default: $MPCHECKER_DATA)')
 
+    # fo orbit refinement
+    parser.add_argument('--mpcat-dir', type=Path, metavar='DIR',
+                        help='Directory containing NumObs.txt / UnnObs.txt and '
+                             'their .idx.npy index files.  When provided, all objects '
+                             'with perihelion q < --fo-refit-q are refit via fo before '
+                             'Phase 1, ensuring accurate positions near close approaches.')
+    parser.add_argument('--fo-refit-q', type=float, default=1.1, metavar='AU',
+                        help='Perihelion threshold for pre-Phase 1 fo orbit refit '
+                             '(default: 1.1 AU; covers all Atiras/Atens/Apollos/inner Amors)')
+    parser.add_argument('--fo-epoch-window', type=float, default=5.0, metavar='DAYS',
+                        help='Cache bin width in days for fo refits (default: 5; '
+                             'fits are shared across observations within the same bin)')
+
     # Misc
     parser.add_argument('--dedup', action='store_true',
                         help='Only check the first observation per object designation '
@@ -267,7 +280,8 @@ def main(argv=None):
     # --serve / --start-daemon / --stop-daemon modes
     if args.serve:
         from .daemon import serve
-        serve(mag_limit=args.maglim, n_workers=args.workers)
+        serve(mag_limit=args.maglim, n_workers=args.workers,
+              mpcat_dir=args.mpcat_dir)
         return 0
 
     if args.start_daemon:
@@ -276,7 +290,8 @@ def main(argv=None):
             print('Daemon is already running.')
             return 0
         print('Starting daemon …')
-        pid = start_daemon_background(mag_limit=args.maglim, n_workers=args.workers)
+        pid = start_daemon_background(mag_limit=args.maglim, n_workers=args.workers,
+                                      mpcat_dir=args.mpcat_dir)
         from .daemon import _log_path
         import time
         for _ in range(40):          # wait up to 20 s for ready message
@@ -303,6 +318,7 @@ def main(argv=None):
         cfg.ORBS_DIR    = args.data_dir / 'orbits'
         cfg.SPICE_DIR   = args.data_dir / 'spice'
         cfg.CACHE_DIR   = args.data_dir / 'cache'
+        cfg.FO_CACHE_DIR = cfg.CACHE_DIR / 'fo_fits'
         cfg.MPCORB_FILE = cfg.ORBS_DIR / 'MPCORB.DAT'
         cfg.MPCORB_GZ   = cfg.ORBS_DIR / 'MPCORB.DAT.gz'
         cfg.COMET_FILE  = cfg.ORBS_DIR / 'AllCometEls.txt'
@@ -434,6 +450,8 @@ def main(argv=None):
                 'dynmodel':             args.dynmodel,
                 'check_sats':           not args.no_satellites,
                 'n_workers':            args.workers,
+                'fo_refit_q_threshold': args.fo_refit_q,
+                'fo_epoch_window_days': args.fo_epoch_window,
             }
             results = query_daemon(observations, daemon_params)
             if results is not None:
@@ -489,6 +507,16 @@ def main(argv=None):
         except Exception as exc:
             logging.getLogger(__name__).debug('Sky index unavailable: %s', exc)
 
+    # Optionally load MPCAT index for fo orbit refinement
+    mpcat_index = None
+    if args.mpcat_dir:
+        try:
+            from .mpcat import MPCATIndex
+            mpcat_index = MPCATIndex(args.mpcat_dir)
+            print(f'MPCAT index loaded for fo orbit refinement.', file=sys.stderr)
+        except Exception as exc:
+            print(f'WARNING: could not load MPCAT index: {exc}', file=sys.stderr)
+
     # Run checks
     from .checker import check_observations
     results = check_observations(
@@ -502,6 +530,10 @@ def main(argv=None):
         check_sats=(not args.no_satellites),
         sky_index=sky_index,
         n_workers=args.workers,
+        mpcat_index=mpcat_index,
+        fo_refit_q_threshold=args.fo_refit_q,
+        fo_epoch_window_days=args.fo_epoch_window,
+        fo_progress=(args.verbose or args.debug),
     )
 
     # Format and output
