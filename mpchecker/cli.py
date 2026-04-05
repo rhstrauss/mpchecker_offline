@@ -72,6 +72,16 @@ def _dec_to_dms(dec_deg: float) -> str:
 
 def _ident_display_name(ident) -> str:
     """Return the best human-readable name for an Identification."""
+    if ident.method == 'orbit_fit':
+        # fo's element-derived catalog match is more reliable than the Phase 2
+        # anchor, which can be a coincidental ephemeris hit near a close-approach
+        # tracklet.  Prefer fo_catalog_name when available.
+        if ident.fo_catalog_name:
+            return ident.fo_catalog_name
+        if ident.match is not None:
+            return ident.match.name
+        return 'unknown'
+    # ephemeris method: Phase 2 match is definitive
     m = ident.match
     if m is not None:
         return m.name

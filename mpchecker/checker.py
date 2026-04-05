@@ -335,6 +335,27 @@ def _phase1_one_obs(
                 log.debug('%s: +%d high-e candidates from wide pre-filter',
                           obs.designation, len(extra))
 
+    # Third pass: close-approach NEOs (Apollo/Aten/Amor, q < 1.3 AU) that are
+    # fainter than h_cut in absolute magnitude but can be very bright at close
+    # approach.  At delta=0.02 AU an H=24.5 object is mag ~17; the standard
+    # H_cut (based on r≈2.5, delta≈1.5) entirely misses these.
+    # ~22K catalog objects fall in this regime; Keplerian pre-filter on them
+    # costs < 10 ms and false positives are handled by Phase 2.
+    h_cut_neo = mag_limit - 5.0 * np.log10(1.0 * 0.02) + 1.5  # delta_min=0.02 AU
+    if h_cut_neo > h_cut and len(asteroids) > 0:
+        q_arr   = asteroids['a'] * (1.0 - asteroids['e'])
+        neo_pass_mask = (q_arr < 1.3) & (asteroids['H'] > h_cut) & (asteroids['H'] <= h_cut_neo)
+        if np.any(neo_pass_mask):
+            neo_indices = np.where(neo_pass_mask)[0]
+            kep_neo = _asteroid_prefilter(
+                asteroids[neo_pass_mask], obs_helio, t_tt,
+                obs.ra_deg, obs.dec_deg, max(prefilter_deg, _WIDE_PREFILTER_DEG))
+            extra = neo_indices[kep_neo]
+            if len(extra):
+                ast_cands = np.unique(np.concatenate([ast_cands, extra]))
+                log.debug('%s: +%d close-approach NEO candidates (q<1.3, H>%.1f)',
+                          obs.designation, len(extra), h_cut)
+
     comet_cands = np.array([], dtype=np.intp)
     if len(comets) > 0:
         comet_mask  = _comet_prefilter(
@@ -729,7 +750,7 @@ def _find_catalog_match_by_elements(
     Parameters
     ----------
     fo_arr    : 1-element ASTEROID_DTYPE array from refit_from_obs()
-    asteroids : full MPCORB structured array
+    asteroids : MPCORB structured array (may be H-limited)
     threshold : maximum score to accept a match (default: 0.05)
 
     Returns
@@ -752,6 +773,31 @@ def _find_catalog_match_by_elements(
         name   = str(asteroids['desig'][best_idx]).strip()
         packed = str(asteroids['packed'][best_idx]).strip()
         return name, packed, best_score
+
+    # Not found in the (possibly H-limited) catalog.  If the fitted orbit has
+    # q < 1.3 AU (potential Apollo/Aten/Amor), fall back to searching the full
+    # MPCORB catalog which includes faint close-approach NEOs (H > H_cut).
+    # These are excluded from the runtime catalog for Phase 1/2 efficiency, but
+    # must be included in element-similarity identification.
+    q_fo = a_fo * (1.0 - e_fo)
+    if q_fo < 1.3:
+        try:
+            from .mpcorb import load_mpcorb
+            full_ast = load_mpcorb()   # uses cache — fast after first load
+            if len(full_ast) > len(asteroids):
+                da2 = np.abs(full_ast['a'] - a_fo)
+                de2 = np.abs(full_ast['e'] - e_fo)
+                di2 = np.abs(full_ast['i'] - i_fo)
+                score2 = da2 + de2 + di2 / 10.0
+                best2  = int(np.argmin(score2))
+                s2     = float(score2[best2])
+                if s2 < threshold:
+                    return (str(full_ast['desig'][best2]).strip(),
+                            str(full_ast['packed'][best2]).strip(),
+                            s2)
+        except Exception:
+            pass
+
     return None, None, None
 
 
@@ -1016,7 +1062,11 @@ def identify_tracklet(
                             fo_orbit, asteroids)
 
                         # If fo embedded a real designation in desig[] (not temp),
-                        # prefer that over element-similarity result
+                        # prefer it over the element-similarity result — but only
+                        # when the designation's catalog elements are consistent
+                        # with the fitted orbit (score < threshold). fo sometimes
+                        # mis-identifies close-approach objects, embedding names
+                        # that belong to completely different orbits.
                         fo_desig = str(fo_orbit['desig'][0]).strip()
                         if fo_desig and fo_desig not in ('ZMPCK', ''):
                             idx = np.where(
@@ -1024,9 +1074,17 @@ def identify_tracklet(
                                 (asteroids['packed'] == fo_desig)
                             )[0]
                             if len(idx):
-                                cat_name   = str(asteroids['desig'][idx[0]]).strip()
-                                cat_packed = str(asteroids['packed'][idx[0]]).strip()
-                                cat_score  = 0.0
+                                fo_desig_score = float(
+                                    abs(asteroids['a'][idx[0]] - float(fo_orbit['a'][0]))
+                                    + abs(asteroids['e'][idx[0]] - float(fo_orbit['e'][0]))
+                                    + abs(asteroids['i'][idx[0]] - float(fo_orbit['i'][0])) / 10.0
+                                )
+                                if fo_desig_score < 0.05:
+                                    cat_name   = str(asteroids['desig'][idx[0]]).strip()
+                                    cat_packed = str(asteroids['packed'][idx[0]]).strip()
+                                    cat_score  = fo_desig_score
+                                # else: fo's designation doesn't match fitted elements;
+                                # fall through and use element-similarity result
                             else:
                                 cat_name  = fo_desig
                                 cat_score = 0.0

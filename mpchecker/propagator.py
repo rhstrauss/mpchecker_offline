@@ -844,22 +844,37 @@ def oorb_ephemeris(
             result = _apply_topocentric_correction(result, t_mjd, obscode, obscodes)
         return result
 
-    # Non-zero error: fall back to processing orbits one-by-one to identify
-    # and skip problematic objects. Returns NaN rows for failures.
-    log.warning('pyoorb batch error %d; retrying %d orbits individually', err, n)
+    # Non-zero error: split into sub-batches and retry after reinit.
+    log.warning('pyoorb batch error %d; retrying %d orbits in sub-batches', err, n)
+    _init_oorb(force=True)
+    _SUBBATCH = 200
     result = np.full((n, 11), np.nan)
     result[:, 9] = 99.0   # default V-mag = 99 (marks failure)
-    for j in range(n):
-        single = orbits[j:j+1]
+    for start in range(0, n, _SUBBATCH):
+        chunk = orbits[start:start + _SUBBATCH]
         try:
             e2, err2 = oo.pyoorb.oorb_ephemeris_basic(
-                in_orbits=single,
+                in_orbits=chunk,
                 in_obscode='500 ',
                 in_date_ephems=epochs,
                 in_dynmodel=dynmodel,
             )
             if err2 == 0:
-                result[j] = e2[0, 0]
+                result[start:start + len(chunk)] = e2[:, 0, :]
+            else:
+                _init_oorb(force=True)
+                for j in range(len(chunk)):
+                    try:
+                        e3, err3 = oo.pyoorb.oorb_ephemeris_basic(
+                            in_orbits=chunk[j:j+1],
+                            in_obscode='500 ',
+                            in_date_ephems=epochs,
+                            in_dynmodel=dynmodel,
+                        )
+                        if err3 == 0:
+                            result[start + j] = e3[0, 0]
+                    except Exception:
+                        pass
         except Exception:
             pass
     if obscodes is not None:
@@ -900,23 +915,44 @@ def oorb_ephemeris_multi_epoch(
             eph = _apply_topocentric_correction(eph, t_mjd_list, obscode, obscodes)
         return eph  # [n_orbits, n_epochs, 11]
 
-    # Non-zero error: fall back to per-object retry
-    log.warning('pyoorb multi-epoch batch error %d; retrying %d orbits individually',
+    # Non-zero error: split into sub-batches and retry.
+    # The batch may have failed because: (a) too many orbits (pyoorb internal
+    # limit, error 35), or (b) a corrupted integrator state. Re-initialise
+    # before retrying so that close-approach orbits (which fail silently when
+    # state is dirty) are processed correctly.
+    log.warning('pyoorb multi-epoch batch error %d; retrying %d orbits in sub-batches',
                 err, len(orbits))
+    _init_oorb(force=True)
+    _SUBBATCH = 200   # well below pyoorb's internal limit
     n = len(orbits)
     result = np.full((n, n_epochs, 11), np.nan)
     result[:, :, 9] = 99.0
-    for j in range(n):
-        single = orbits[j:j+1]
+    for start in range(0, n, _SUBBATCH):
+        chunk = orbits[start:start + _SUBBATCH]
         try:
             e2, err2 = oo.pyoorb.oorb_ephemeris_basic(
-                in_orbits=single,
+                in_orbits=chunk,
                 in_obscode='500 ',
                 in_date_ephems=epochs,
                 in_dynmodel=dynmodel,
             )
             if err2 == 0:
-                result[j] = e2[0]
+                result[start:start + len(chunk)] = e2
+            else:
+                # Sub-batch also failed: retry one-by-one within this chunk
+                _init_oorb(force=True)
+                for j in range(len(chunk)):
+                    try:
+                        e3, err3 = oo.pyoorb.oorb_ephemeris_basic(
+                            in_orbits=chunk[j:j+1],
+                            in_obscode='500 ',
+                            in_date_ephems=epochs,
+                            in_dynmodel=dynmodel,
+                        )
+                        if err3 == 0:
+                            result[start + j] = e3[0]
+                    except Exception:
+                        pass
         except Exception:
             pass
     if obscodes is not None:
