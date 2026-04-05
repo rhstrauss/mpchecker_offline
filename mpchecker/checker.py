@@ -15,7 +15,7 @@ Results are returned as a list of Match dataclasses, one per observation.
 """
 
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -62,6 +62,38 @@ class CheckResult:
     """Results for one input observation."""
     obs:     Observation
     matches: List[Match] = field(default_factory=list)
+
+
+@dataclass
+class Identification:
+    """
+    Orbit-level identification: a single catalog candidate whose predicted
+    orbit fits all (or min_obs) input observations simultaneously.
+
+    Returned by identify_tracklet().  An Identification represents a high-
+    confidence association between an input multi-observation tracklet and a
+    known catalog object: the candidate's orbit explains the observed positions
+    at every input epoch, with per-observation O-C residuals all within the
+    requested threshold.
+
+    Fields
+    ------
+    match       : the candidate, as it appeared in Phase 2 results
+    residuals   : per-observation O-C in arcsec (same order as input observations)
+    rms_arcsec  : RMS of residuals across all input observations
+    n_obs       : total number of input observations
+    method      : 'ephemeris'  — residuals computed from catalog orbit via pyoorb
+                  'orbit_fit'  — independent orbit fit to input obs via fo;
+                                 residuals are O-C from the fo solution
+    fo_elements : fitted orbit (1-element ASTEROID_DTYPE array); only set when
+                  method='orbit_fit'
+    """
+    match:       Match
+    residuals:   List[float]
+    rms_arcsec:  float
+    n_obs:       int
+    method:      str
+    fo_elements: Optional[np.ndarray] = None
 
 
 # ---------------------------------------------------------------------------
@@ -658,3 +690,205 @@ def check_observations(
         res.matches.sort(key=lambda m: m.sep_arcsec)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Tracklet identification
+# ---------------------------------------------------------------------------
+
+def identify_tracklet(
+    observations: List[Observation],
+    results: List[CheckResult],
+    asteroids: np.ndarray,
+    comets: np.ndarray,
+    obscodes: dict,
+    dynmodel: str = 'N',
+    residual_threshold_arcsec: float = 2.0,
+    min_obs: Optional[int] = None,
+    fo_fit: bool = False,
+    fo_timeout_sec: int = 60,
+) -> List[Identification]:
+    """
+    Identify which catalog candidates explain all input observations as a tracklet.
+
+    For each candidate that appeared in Phase 2 results for >= min_obs of the
+    input observations, this function computes precise pyoorb predicted positions
+    at EVERY input observation epoch and reports per-observation O-C residuals.
+    Any candidate with all residuals <= residual_threshold_arcsec is returned as
+    an Identification, sorted by RMS residual (best first).
+
+    When fo_fit=True and 'fo' (Project Pluto's find_orb) is available, an
+    independent orbit is fitted to the input observations themselves.  The
+    fitted orbit's per-observation residuals (O-C from the fo solution) are
+    added as a separate method='orbit_fit' Identification entry alongside the
+    best ephemeris match.  This brute-force orbit check independently confirms
+    that the observations are self-consistent with a single physical orbit and
+    quantifies the fit quality.
+
+    Parameters
+    ----------
+    observations              : input observations (same list as check_observations)
+    results                   : Phase 2 output from check_observations()
+    asteroids                 : structured array from load_mpcorb()
+    comets                    : structured array from load_comets()
+    obscodes                  : dict from load_obscodes()
+    dynmodel                  : pyoorb dynamics ('N' = N-body, '2' = two-body)
+    residual_threshold_arcsec : max O-C (arcsec) for any single observation.
+                                Candidates with any residual above this are
+                                excluded from the identification list. Default: 2".
+    min_obs                   : minimum number of observations a candidate must
+                                appear in to be tested.  Default (None): require
+                                the candidate to appear in ALL input observations.
+    fo_fit                    : if True, additionally run find_orb on the input
+                                observations as an independent orbit determination.
+                                Requires 'fo' to be on PATH.
+    fo_timeout_sec            : find_orb timeout in seconds (default: 60)
+
+    Returns
+    -------
+    List of Identification objects sorted by rms_arcsec ascending (best first).
+    Returns an empty list if len(observations) < 2, or no candidates satisfy
+    the threshold.
+    """
+    if len(observations) < 2:
+        return []
+
+    n_obs     = len(observations)
+    threshold = n_obs if min_obs is None else max(1, min_obs)
+
+    # ---- Count how many input observations each Phase 2 candidate appears in ----
+    count:      Counter = Counter()
+    best_match: dict    = {}
+    for res in results:
+        for m in res.matches:
+            if m.obj_type == 'satellite':
+                continue   # satellites have no catalog orbit to test
+            key = (m.packed, m.obj_type)
+            count[key] += 1
+            if key not in best_match or m.sep_arcsec < best_match[key].sep_arcsec:
+                best_match[key] = m
+
+    qualifying = [(pk, ot) for (pk, ot), cnt in count.items() if cnt >= threshold]
+    if not qualifying:
+        log.debug('identify_tracklet: no candidates appeared in >= %d/%d observations',
+                  threshold, n_obs)
+        return []
+
+    # ---- Pre-compute TT epochs; group by obscode for batched pyoorb calls ----
+    t_tts      = [_utc_to_tt_mjd(obs.epoch_mjd) for obs in observations]
+    by_obscode: dict = defaultdict(list)
+    for i, obs in enumerate(observations):
+        by_obscode[obs.obscode].append(i)
+
+    identifications: List[Identification] = []
+
+    # ---- Ephemeris method: O-C from catalog orbit for each qualifying candidate ----
+    for packed, obj_type in qualifying:
+        try:
+            if obj_type == 'minor_planet':
+                idx = np.where(asteroids['packed'] == packed)[0]
+                if not len(idx):
+                    continue
+                sub   = asteroids[idx[:1]]
+                orbit = build_oorb_orbits_kep(
+                    sub['a'], sub['e'],
+                    sub['i']     * _DEG2RAD, sub['Omega'] * _DEG2RAD,
+                    sub['omega'] * _DEG2RAD, sub['M']     * _DEG2RAD,
+                    sub['epoch'], sub['H'], sub['G'],
+                )
+            elif obj_type == 'comet':
+                idx = np.where(comets['packed'] == packed)[0]
+                if not len(idx):
+                    continue
+                sub   = comets[idx[:1]]
+                orbit = build_oorb_orbits_com(
+                    sub['q'], sub['e'],
+                    sub['i']     * _DEG2RAD, sub['Omega'] * _DEG2RAD,
+                    sub['omega'] * _DEG2RAD, sub['Tp'],
+                    sub['H'], sub['G'],
+                )
+            else:
+                continue
+        except Exception as exc:
+            log.debug('identify_tracklet: orbit build failed for %s: %s', packed, exc)
+            continue
+
+        # Compute pyoorb ephemeris at every input observation epoch
+        obs_residuals: List[float] = [np.inf] * n_obs
+        try:
+            for obscode, obs_indices in by_obscode.items():
+                epoch_tts = [t_tts[i] for i in obs_indices]
+                eph = oorb_ephemeris_multi_epoch(orbit, epoch_tts, obscode, dynmodel,
+                                                  obscodes=obscodes)
+                # eph shape: [1, n_epochs, 11]; col 1=RA, col 2=Dec
+                for k, obs_i in enumerate(obs_indices):
+                    obs = observations[obs_i]
+                    sep = ang_sep_deg(float(eph[0, k, 1]), float(eph[0, k, 2]),
+                                      obs.ra_deg, obs.dec_deg) * 3600.0
+                    obs_residuals[obs_i] = sep
+        except Exception as exc:
+            log.debug('identify_tracklet: ephemeris failed for %s: %s', packed, exc)
+            continue
+
+        if all(r <= residual_threshold_arcsec for r in obs_residuals):
+            rms = float(np.sqrt(np.mean(np.array(obs_residuals) ** 2)))
+            identifications.append(Identification(
+                match=best_match[(packed, obj_type)],
+                residuals=list(obs_residuals),
+                rms_arcsec=rms,
+                n_obs=n_obs,
+                method='ephemeris',
+            ))
+
+    identifications.sort(key=lambda x: x.rms_arcsec)
+
+    # ---- fo orbit fit (optional): brute-force orbit from input observations ----
+    if fo_fit:
+        try:
+            from .orbitfit import refit_from_obs, _fo_available
+            if _fo_available():
+                log.info('identify_tracklet: running fo orbit fit on %d observations', n_obs)
+                fo_orbit = refit_from_obs(observations, timeout_sec=fo_timeout_sec)
+                if fo_orbit is not None:
+                    # Build pyoorb orbit from fo-fitted elements
+                    fo_pyoorb = build_oorb_orbits_kep(
+                        fo_orbit['a'], fo_orbit['e'],
+                        fo_orbit['i']     * _DEG2RAD, fo_orbit['Omega'] * _DEG2RAD,
+                        fo_orbit['omega'] * _DEG2RAD, fo_orbit['M']     * _DEG2RAD,
+                        fo_orbit['epoch'], fo_orbit['H'], fo_orbit['G'],
+                    )
+                    # Compute per-observation O-C from fo orbit
+                    fo_residuals: List[float] = [np.inf] * n_obs
+                    try:
+                        for obscode, obs_indices in by_obscode.items():
+                            epoch_tts = [t_tts[i] for i in obs_indices]
+                            eph = oorb_ephemeris_multi_epoch(
+                                fo_pyoorb, epoch_tts, obscode, dynmodel,
+                                obscodes=obscodes)
+                            for k, obs_i in enumerate(obs_indices):
+                                obs = observations[obs_i]
+                                sep = ang_sep_deg(
+                                    float(eph[0, k, 1]), float(eph[0, k, 2]),
+                                    obs.ra_deg, obs.dec_deg) * 3600.0
+                                fo_residuals[obs_i] = sep
+                    except Exception as exc:
+                        log.debug('identify_tracklet: fo residual computation failed: %s', exc)
+
+                    if all(r < np.inf for r in fo_residuals):
+                        fo_rms = float(np.sqrt(np.mean(np.array(fo_residuals) ** 2)))
+                        # Attach to best ephemeris identification (if any)
+                        anchor = identifications[0].match if identifications else (
+                            best_match[qualifying[0]] if qualifying else None)
+                        if anchor is not None:
+                            identifications.append(Identification(
+                                match=anchor,
+                                residuals=list(fo_residuals),
+                                rms_arcsec=fo_rms,
+                                n_obs=n_obs,
+                                method='orbit_fit',
+                                fo_elements=fo_orbit,
+                            ))
+        except Exception as exc:
+            log.debug('identify_tracklet: fo fit failed: %s', exc)
+
+    return identifications

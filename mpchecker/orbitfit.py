@@ -290,6 +290,188 @@ def refit_cache_key(packed: str, last_obs_mjd: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tracklet orbit fit — run fo on the input observations themselves
+# ---------------------------------------------------------------------------
+
+def _mjd_to_gregorian(mjd: float):
+    """
+    Convert MJD UTC to (year, month, day_float) using the Meeus algorithm.
+    Inverse of _gregorian_to_mjd; avoids astropy for pre-1972 dates.
+    """
+    jd = mjd + 2400000.5 + 0.5    # shift so integer part = Julian Day Number
+    z  = int(jd)
+    f  = jd - z                    # fractional day
+    if z < 2299161:                # Julian calendar
+        a = z
+    else:                          # Gregorian calendar
+        alpha = int((z - 1867216.25) / 36524.25)
+        a = z + 1 + alpha - int(alpha / 4)
+    b = a + 1524
+    c = int((b - 122.1) / 365.25)
+    d = int(365.25 * c)
+    e = int((b - d) / 30.6001)
+    day   = b - d - int(30.6001 * e) + f
+    month = e - 1 if e < 14 else e - 13
+    year  = c - 4716 if month > 2 else c - 4715
+    return year, month, day
+
+
+def _obs_to_mpc80(obs, temp_desig: str = 'ZMPCK') -> str:
+    """
+    Format an Observation as a 80-column MPC line with a temporary designation.
+
+    When obs.line is already a valid MPC80 line (≥77 chars), reuses it verbatim
+    and only replaces cols 1–12 with temp_desig so fo treats all observations
+    as a single tracklet.  Falls back to constructing a synthetic line from the
+    parsed Observation fields for ADES / hldet input.
+
+    Parameters
+    ----------
+    obs        : Observation instance
+    temp_desig : 1–5 character string used as the packed designation (col 1–5).
+                 Cols 6–12 (provisional desig) are left blank.
+    """
+    desig5 = temp_desig[:5].ljust(5)
+    prov7  = '       '  # 7 spaces — blank provisional designation
+
+    # If the original line is valid MPC80, reuse it (preserves full precision)
+    raw = getattr(obs, 'line', '')
+    if raw and len(raw.rstrip('\n')) >= 77 and raw.strip():
+        line = raw.rstrip('\n').ljust(80)
+        line = desig5 + prov7 + line[12:]   # replace designation, keep rest
+        return line[:80] + '\n'
+
+    # Construct a synthetic MPC80 line from parsed fields
+    y, m, d   = _mjd_to_gregorian(obs.epoch_mjd)
+    date_str  = f'{y:4d} {m:02d} {d:09.6f}'     # 17 chars: "YYYY MM DD.dddddd"
+
+    ra_h  = obs.ra_deg / 15.0
+    ra_H  = int(ra_h)
+    ra_mi = int((ra_h - ra_H) * 60)
+    ra_sc = ((ra_h - ra_H) * 60 - ra_mi) * 60
+    ra_str  = f'{ra_H:02d} {ra_mi:02d} {ra_sc:06.3f}'      # 12 chars
+
+    dec_sgn = '+' if obs.dec_deg >= 0 else '-'
+    dec_abs = abs(obs.dec_deg)
+    dec_D   = int(dec_abs)
+    dec_mi  = int((dec_abs - dec_D) * 60)
+    dec_sc  = ((dec_abs - dec_D) * 60 - dec_mi) * 60
+    dec_str = f'{dec_sgn}{dec_D:02d} {dec_mi:02d} {dec_sc:05.2f}'  # 12 chars
+
+    mag_str  = f'{obs.mag:4.1f} ' if obs.mag is not None else '     '  # 5 chars
+    band_str = (obs.band or 'V')[0]                                      # 1 char
+    obs_str  = obs.obscode.ljust(3)[:3]                                  # 3 chars
+
+    # Layout: 5 + 7 + 1 + 1 + 1 + 17 + 12 + 12 + 9 + 5 + 1 + 6 + 3 = 80
+    line = (desig5 + prov7
+            + ' '   # col 13: discovery (blank)
+            + ' '   # col 14: note1 (blank)
+            + 'C'   # col 15: note2 = CCD
+            + date_str + ra_str + dec_str
+            + '         '   # cols 57-65: blank
+            + mag_str + band_str
+            + '      '      # cols 72-77: blank
+            + obs_str)
+    return line[:80].ljust(80) + '\n'
+
+
+def refit_from_obs(
+    observations: list,
+    temp_desig: str = 'ZMPCK',
+    timeout_sec: int = 60,
+) -> Optional[np.ndarray]:
+    """
+    Fit an orbit to the input observations using fo (find_orb).
+
+    All observations are formatted as MPC 80-column with a temporary designation
+    so fo treats them as a single tracklet.  The fitted orbital elements are
+    returned as a 1-element ASTEROID_DTYPE numpy structured array.
+
+    This is used by identify_tracklet() to independently verify that the input
+    observations are self-consistent with a physical orbit (the 'orbit_fit'
+    identification method).
+
+    Parameters
+    ----------
+    observations : list of Observation objects (the input tracklet)
+    temp_desig   : temporary designation string written into cols 1–5 of the
+                   MPC80 lines passed to fo (default: 'ZMPCK')
+    timeout_sec  : maximum wall time for fo (seconds)
+
+    Returns
+    -------
+    1-element numpy structured array (ASTEROID_DTYPE) with fitted elements,
+    or None if fo is unavailable, fewer than 3 valid lines are produced,
+    or the fit fails / times out.
+    """
+    if not _fo_available():
+        log.debug('refit_from_obs: fo not found')
+        return None
+
+    obs_lines = [_obs_to_mpc80(obs, temp_desig) for obs in observations]
+    obs_lines = [l for l in obs_lines if l.strip()]
+    if len(obs_lines) < 3:
+        log.debug('refit_from_obs: only %d valid MPC80 lines (need >= 3)', len(obs_lines))
+        return None
+
+    fo_home = Path(tempfile.mkdtemp(prefix='mpchecker_fo_home_'))
+    try:
+        _seed_fo_home(fo_home)
+
+        with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.mpc80', delete=False,
+                prefix='mpchecker_fofit_') as tf:
+            tf.writelines(obs_lines)
+            obs_file = tf.name
+
+        fo_output_dir = fo_home / '.find_orb'
+        fo_env        = {**os.environ, 'HOME': str(fo_home)}
+
+        try:
+            t0 = time.time()
+            result = subprocess.run(
+                ['fo', obs_file],
+                capture_output=True, text=True,
+                timeout=timeout_sec, env=fo_env,
+            )
+            log.debug('refit_from_obs: fo finished in %.1fs (rc=%d)',
+                      time.time() - t0, result.returncode)
+
+            if result.returncode != 0:
+                log.debug('refit_from_obs: fo returned %d: %s',
+                          result.returncode, result.stderr[:200])
+                return None
+
+            json_path = fo_output_dir / 'total.json'
+            if not json_path.exists():
+                json_path = fo_output_dir / 'elem_short.json'
+            if not json_path.exists():
+                log.debug('refit_from_obs: fo produced no output JSON')
+                return None
+
+            el = _parse_fo_json(json_path)
+            if el is None:
+                return None
+
+            return _elements_to_array(el, temp_desig)
+
+        except subprocess.TimeoutExpired:
+            log.debug('refit_from_obs: fo timed out (%ds)', timeout_sec)
+            return None
+        except Exception as exc:
+            log.debug('refit_from_obs: fo failed: %s', exc)
+            return None
+        finally:
+            try:
+                os.unlink(obs_file)
+            except OSError:
+                pass
+
+    finally:
+        shutil.rmtree(fo_home, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # Batch helpers for pre-Phase 1 NEO orbit refitting
 # ---------------------------------------------------------------------------
 

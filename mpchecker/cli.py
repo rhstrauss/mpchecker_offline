@@ -64,6 +64,59 @@ def _dec_to_dms(dec_deg: float) -> str:
     return f'{sign}{d:02d} {m:02d} {s:05.2f}'
 
 
+def format_identifications(identifications, observations,
+                           designation: str = '') -> str:
+    """
+    Format tracklet identification results for console output.
+
+    Parameters
+    ----------
+    identifications : list of Identification objects from identify_tracklet()
+    observations    : the input observation list for this tracklet
+    designation     : cluster/tracklet label to show in the header (optional)
+    """
+    if not identifications:
+        return ''
+    label = f' [{designation}]' if designation else ''
+    lines = [f'\n{"="*60}',
+             f'Tracklet identification{label} ({len(observations)} obs):',
+             f'{"="*60}']
+    for rank, ident in enumerate(identifications, 1):
+        m = ident.match
+        method_label = {
+            'ephemeris':  'catalog orbit (pyoorb)',
+            'orbit_fit':  'fo orbit fit',
+        }.get(ident.method, ident.method)
+        lines.append(
+            f'\n [{rank}] {m.name}  [{method_label}]'
+            f'  RMS = {ident.rms_arcsec:.2f}"'
+        )
+        # Show individual residuals (truncate if very many observations)
+        resids = ident.residuals
+        if len(resids) <= 12:
+            resid_str = '  '.join(f'{r:.2f}"' for r in resids)
+        else:
+            first6 = '  '.join(f'{r:.2f}"' for r in resids[:6])
+            last2  = '  '.join(f'{r:.2f}"' for r in resids[-2:])
+            resid_str = f'{first6}  …  {last2}  (n={len(resids)})'
+        lines.append(f'     O-C per obs: {resid_str}')
+        if ident.method == 'ephemeris':
+            lines.append(
+                f'     Catalog: V={m.vmag:.1f}  sep={m.sep_arcsec:.1f}"  '
+                f'r={m.r_helio:.3f} AU  Δ={m.delta:.3f} AU  phase={m.phase_deg:.1f}°'
+            )
+        if ident.method == 'orbit_fit' and ident.fo_elements is not None:
+            el = ident.fo_elements
+            lines.append(
+                f'     fo elements: a={float(el["a"][0]):.4f} AU  '
+                f'e={float(el["e"][0]):.4f}  '
+                f'i={float(el["i"][0]):.2f}°  '
+                f'epoch MJD {float(el["epoch"][0]):.1f}'
+            )
+    lines.append('')
+    return '\n'.join(lines)
+
+
 def format_results(results, search_radius_arcmin: float) -> str:
     lines = []
     for res in results:
@@ -259,6 +312,22 @@ def main(argv=None):
                         help='Cache bin width in days for fo refits (default: 5; '
                              'fits are shared across observations within the same bin)')
 
+    # Tracklet identification
+    parser.add_argument('--identify', action='store_true',
+                        help='After finding matches, test which candidate fits ALL '
+                             'input observations as a single physical orbit (O-C residuals '
+                             'via pyoorb for each candidate that appears in every observation)')
+    parser.add_argument('--id-threshold', type=float, default=2.0, metavar='ARCSEC',
+                        help='Maximum O-C residual (arcsec) for any single observation '
+                             'to count as an identification (default: 2.0)')
+    parser.add_argument('--id-min-obs', type=int, default=None, metavar='N',
+                        help='Minimum number of input observations a candidate must appear '
+                             'in to be tested for identification (default: all observations)')
+    parser.add_argument('--fo-fit', action='store_true',
+                        help='(with --identify) additionally run find_orb on the input '
+                             'observations to independently fit a brute-force orbit and '
+                             'confirm physical self-consistency')
+
     # Misc
     parser.add_argument('--dedup', action='store_true',
                         help='Only check the first observation per object designation '
@@ -440,8 +509,9 @@ def main(argv=None):
 
     print(f'Checking {len(observations)} observation(s) …', file=sys.stderr)
 
-    # Try daemon first (skip if --no-daemon or daemon not running)
-    if not args.no_daemon:
+    # Try daemon first (skip if --no-daemon, --identify, or daemon not running)
+    # --identify requires catalog data loaded locally (can't delegate to daemon)
+    if not args.no_daemon and not args.identify:
         from .daemon import query_daemon, is_daemon_running
         if is_daemon_running():
             daemon_params = {
@@ -536,6 +606,83 @@ def main(argv=None):
         fo_progress=(args.verbose or args.debug),
     )
 
+    # Optional: tracklet identification (O-C residuals across all observations)
+    identification_output = ''
+    if args.identify:
+        from .checker import identify_tracklet
+        from collections import defaultdict as _dd
+
+        # Group by designation so each cluster is identified independently.
+        # If there's only one designation (or all are blank), treat all obs as
+        # a single tracklet (backwards-compatible with the --ra/--dec path).
+        desig_keys = [obs.packed_desig or obs.designation or '' for obs in observations]
+        unique_desigs = list(dict.fromkeys(desig_keys))   # preserve order, dedup
+
+        id_parts = []
+        if len(unique_desigs) <= 1:
+            # Single tracklet — original behaviour
+            idents = identify_tracklet(
+                observations, results,
+                asteroids, comets, obscodes,
+                dynmodel=args.dynmodel,
+                residual_threshold_arcsec=args.id_threshold,
+                min_obs=args.id_min_obs,
+                fo_fit=args.fo_fit,
+                fo_timeout_sec=60,
+            )
+            if idents:
+                id_parts.append(format_identifications(
+                    idents, observations, designation=unique_desigs[0]))
+            else:
+                id_parts.append(
+                    f'\n{"="*60}\n'
+                    f'Tracklet identification: no candidates satisfy all '
+                    f'{len(observations)} observations with O-C ≤ '
+                    f'{args.id_threshold:.1f}" threshold.\n'
+                )
+        else:
+            # Multi-cluster file: run identify_tracklet per designation group.
+            # Build index maps once.
+            idx_by_desig: dict = _dd(list)
+            for i, key in enumerate(desig_keys):
+                idx_by_desig[key].append(i)
+
+            n_identified = 0
+            for desig in unique_desigs:
+                grp_indices = idx_by_desig[desig]
+                if len(grp_indices) < 2:
+                    continue   # single observation — can't fit an orbit
+                grp_obs     = [observations[i] for i in grp_indices]
+                grp_results = [results[i] for i in grp_indices]
+
+                idents = identify_tracklet(
+                    grp_obs, grp_results,
+                    asteroids, comets, obscodes,
+                    dynmodel=args.dynmodel,
+                    residual_threshold_arcsec=args.id_threshold,
+                    min_obs=args.id_min_obs,
+                    fo_fit=args.fo_fit,
+                    fo_timeout_sec=60,
+                )
+                if idents:
+                    n_identified += 1
+                    id_parts.append(format_identifications(
+                        idents, grp_obs, designation=desig))
+                # (silently skip unidentified clusters to keep output clean)
+
+            if not id_parts:
+                id_parts.append(
+                    f'\n{"="*60}\n'
+                    f'Tracklet identification: none of the {len(unique_desigs)} '
+                    f'clusters matched with O-C ≤ {args.id_threshold:.1f}" '
+                    f'in all observations.\n'
+                )
+            else:
+                id_parts.insert(0,
+                    f'\nIdentified {n_identified}/{len(unique_desigs)} clusters:\n')
+
+        identification_output = ''.join(id_parts)
+
     # Format and output
     output = format_results(results, args.radius)
     total_matches = sum(len(r.matches) for r in results)
@@ -543,9 +690,13 @@ def main(argv=None):
     if args.output:
         with open(args.output, 'w') as f:
             f.write(output + '\n')
+            if identification_output:
+                f.write(identification_output + '\n')
         print(f'Results written to {args.output}', file=sys.stderr)
     else:
         print(output)
+        if identification_output:
+            print(identification_output)
 
     if total_matches == 0 and len(asteroids) > 0:
         print('Hint: 0 matches found. Run with --debug for pipeline diagnostics.',
