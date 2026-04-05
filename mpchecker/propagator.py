@@ -178,6 +178,13 @@ def _make_numba_kernel():
 _NUMBA_KEP_KERNEL = _make_numba_kernel()
 if _NUMBA_KEP_KERNEL is not None:
     log.debug('Numba Keplerian kernel loaded (parallel JIT)')
+    try:
+        import numba
+        _n = min(64, numba.config.NUMBA_NUM_THREADS or 128)
+        numba.set_num_threads(_n)
+        log.debug('Numba thread count set to %d', _n)
+    except Exception:
+        pass
 else:
     log.debug('Numba not available; using NumPy Keplerian propagation')
 

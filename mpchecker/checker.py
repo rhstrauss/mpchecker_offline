@@ -118,6 +118,15 @@ def _utc_to_tt_mjd(mjd_utc: float) -> float:
     return Time(mjd_utc, format='mjd', scale='utc').tt.mjd
 
 
+def _utc_to_tt_mjd_vec(mjd_utc_iterable) -> np.ndarray:
+    """Vectorized UTC MJD → TT MJD: single astropy.Time call for an iterable."""
+    from astropy.time import Time
+    arr = np.asarray(list(mjd_utc_iterable), dtype=np.float64)
+    if len(arr) == 0:
+        return arr
+    return Time(arr, format='mjd', scale='utc').tt.mjd
+
+
 def _rate_to_arcsec_per_hr(deg_per_day: float) -> float:
     return deg_per_day * 3600.0 / 24.0
 
@@ -230,6 +239,57 @@ def _asteroid_prefilter(
     return sep <= radius_deg
 
 
+@dataclass
+class AsteroidSOA:
+    """Pre-extracted contiguous float64 column arrays from the asteroid catalog.
+    Built once (e.g. at daemon startup) to eliminate strided copy overhead
+    when running the full-catalog Keplerian pre-filter.
+    """
+    a:         np.ndarray
+    e:         np.ndarray
+    i_rad:     np.ndarray   # inclination (radians)
+    Omega_rad: np.ndarray   # longitude of ascending node (radians)
+    omega_rad: np.ndarray   # argument of periapsis (radians)
+    M_rad:     np.ndarray   # mean anomaly (radians)
+    epoch:     np.ndarray   # epoch MJD TT
+    H:         np.ndarray   # absolute magnitude
+
+
+def build_asteroid_soa(asteroids: np.ndarray) -> AsteroidSOA:
+    """Build pre-extracted contiguous float64 arrays from the structured asteroid catalog."""
+    return AsteroidSOA(
+        a=np.ascontiguousarray(asteroids['a'],     dtype=np.float64),
+        e=np.ascontiguousarray(asteroids['e'],     dtype=np.float64),
+        i_rad=np.ascontiguousarray(asteroids['i'],     dtype=np.float64) * _DEG2RAD,
+        Omega_rad=np.ascontiguousarray(asteroids['Omega'], dtype=np.float64) * _DEG2RAD,
+        omega_rad=np.ascontiguousarray(asteroids['omega'], dtype=np.float64) * _DEG2RAD,
+        M_rad=np.ascontiguousarray(asteroids['M'],     dtype=np.float64) * _DEG2RAD,
+        epoch=np.ascontiguousarray(asteroids['epoch'], dtype=np.float64),
+        H=np.ascontiguousarray(asteroids['H'],     dtype=np.float64),
+    )
+
+
+def _asteroid_prefilter_soa(
+    soa: AsteroidSOA,
+    h_mask: np.ndarray,
+    obs_helio: np.ndarray,
+    t_tt: float,
+    ra_obs: float,
+    dec_obs: float,
+    radius_deg: float,
+) -> np.ndarray:
+    """Fast prefilter for the full-catalog path using pre-extracted SOA arrays."""
+    ra_pred, dec_pred, _ = kep_to_radec(
+        soa.a[h_mask],         soa.e[h_mask],
+        soa.i_rad[h_mask],     soa.Omega_rad[h_mask],
+        soa.omega_rad[h_mask], soa.M_rad[h_mask],
+        soa.epoch[h_mask],     t_tt,
+        obs_helio,
+    )
+    sep = ang_sep_deg(ra_pred, dec_pred, ra_obs, dec_obs)
+    return sep <= radius_deg
+
+
 def _comet_prefilter(
     comets: np.ndarray,
     obs_helio: np.ndarray,
@@ -280,6 +340,7 @@ def _phase1_one_obs(
     sky_index,
     mag_limit:    float,
     prefilter_deg: float,
+    asteroid_soa: Optional[AsteroidSOA] = None,
 ) -> dict:
     """
     Run Phase 1 (Keplerian pre-filter) for a single observation.
@@ -290,7 +351,8 @@ def _phase1_one_obs(
     obs_helio = get_observer_helio(obs.epoch_mjd, obs.obscode, obscodes)
     h_cut     = _h_limit_from_vmag(mag_limit, obs_helio, obs.ra_deg, obs.dec_deg, obs.epoch_mjd)
 
-    n_h_filtered  = int((asteroids['H'] <= h_cut).sum())
+    _H_arr        = asteroid_soa.H if asteroid_soa is not None else asteroids['H']
+    n_h_filtered  = int((_H_arr <= h_cut).sum())
     ast_cands     = np.array([], dtype=np.intp)
     _INDEX_THRESHOLD = 400_000
 
@@ -298,7 +360,7 @@ def _phase1_one_obs(
             and n_h_filtered > _INDEX_THRESHOLD):
         idx_mask = sky_index.candidates(obs.ra_deg, obs.dec_deg, prefilter_deg,
                                         t_obs_mjd=obs.epoch_mjd)
-        idx_mask &= (asteroids['H'] <= h_cut)
+        idx_mask &= (_H_arr <= h_cut)
         broad_idx = np.where(idx_mask)[0]
         log.debug('Index cone: %d candidates for %s', len(broad_idx), obs.designation)
         if len(broad_idx) > 0:
@@ -307,13 +369,18 @@ def _phase1_one_obs(
                 obs.ra_deg, obs.dec_deg, prefilter_deg)
             ast_cands = broad_idx[kep_mask]
     else:
-        h_mask = asteroids['H'] <= h_cut
+        h_mask = _H_arr <= h_cut
         log.debug('H≤%.1f cut: %d/%d asteroids for %s',
                   h_cut, n_h_filtered, len(asteroids), obs.designation)
         if n_h_filtered > 0:
-            kep_mask          = _asteroid_prefilter(
-                asteroids[h_mask], obs_helio, t_tt,
-                obs.ra_deg, obs.dec_deg, prefilter_deg)
+            if asteroid_soa is not None:
+                kep_mask = _asteroid_prefilter_soa(
+                    asteroid_soa, h_mask, obs_helio, t_tt,
+                    obs.ra_deg, obs.dec_deg, prefilter_deg)
+            else:
+                kep_mask = _asteroid_prefilter(
+                    asteroids[h_mask], obs_helio, t_tt,
+                    obs.ra_deg, obs.dec_deg, prefilter_deg)
             bright_global_idx = np.where(h_mask)[0]
             ast_cands         = bright_global_idx[kep_mask]
 
@@ -391,6 +458,7 @@ def _phase1_worker(idx_obs):
         obs,
         st['asteroids'], st['comets'], st['obscodes'], st['sky_index'],
         st['mag_limit'], st['prefilter_deg'],
+        asteroid_soa=st.get('asteroid_soa'),
     )
 
 
@@ -415,6 +483,7 @@ def check_observations(
     fo_refit_q_threshold: float = 1.1,
     fo_epoch_window_days: float = 5.0,
     fo_progress: bool = False,
+    asteroid_soa: Optional[AsteroidSOA] = None,
 ) -> List[CheckResult]:
     """
     Check each observation against the asteroid/comet catalogs and satellites.
@@ -469,7 +538,7 @@ def check_observations(
     # -----------------------------------------------------------------------
     if (reepoch_threshold_days > 0 and len(asteroids) > 0
             and len(observations) > 0):
-        t_tts_all = [_utc_to_tt_mjd(obs.epoch_mjd) for obs in observations]
+        t_tts_all = _utc_to_tt_mjd_vec(obs.epoch_mjd for obs in observations).tolist()
         obs_epoch_tt  = float(np.median(t_tts_all))
         catalog_epoch = float(np.median(asteroids['epoch']))
         epoch_gap     = abs(obs_epoch_tt - catalog_epoch)
@@ -542,6 +611,7 @@ def check_observations(
             'sky_index':    sky_index,
             'mag_limit':    mag_limit,
             'prefilter_deg': prefilter_deg,
+            'asteroid_soa': asteroid_soa,
         }
         nw = min(n_workers, len(observations))
         ctx = mp.get_context('fork')
@@ -551,7 +621,7 @@ def check_observations(
     else:
         obs_meta = [
             _phase1_one_obs(obs, asteroids, comets, obscodes, sky_index,
-                            mag_limit, prefilter_deg)
+                            mag_limit, prefilter_deg, asteroid_soa=asteroid_soa)
             for obs in observations
         ]
 
@@ -882,7 +952,7 @@ def identify_tracklet(
         # fo_fit=True: still try a blind orbit fit even without Phase 2 candidates
 
     # ---- Pre-compute TT epochs; group by obscode for batched pyoorb calls ----
-    t_tts      = [_utc_to_tt_mjd(obs.epoch_mjd) for obs in observations]
+    t_tts      = _utc_to_tt_mjd_vec(obs.epoch_mjd for obs in observations).tolist()
     by_obscode: dict = defaultdict(list)
     for i, obs in enumerate(observations):
         by_obscode[obs.obscode].append(i)

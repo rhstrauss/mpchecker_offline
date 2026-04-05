@@ -110,6 +110,10 @@ def serve(
     obscodes  = load_obscodes()
     print(f'[daemon] {len(asteroids)} asteroids loaded', flush=True)
 
+    from .checker import build_asteroid_soa
+    print('[daemon] Pre-extracting asteroid SOA …', flush=True)
+    asteroid_soa = build_asteroid_soa(asteroids)
+
     print('[daemon] Loading SPICE kernels …', flush=True)
     _load_base_kernels()
 
@@ -162,7 +166,7 @@ def serve(
             break
         try:
             _handle_client(conn, asteroids, comets, obscodes, sky_index,
-                           n_workers, mpcat_index)
+                           n_workers, mpcat_index, asteroid_soa=asteroid_soa)
         except Exception as exc:
             log.warning('Error handling client: %s', exc)
         finally:
@@ -180,7 +184,7 @@ def serve(
 
 
 def _handle_client(conn, asteroids, comets, obscodes, sky_index, n_workers,
-                   mpcat_index=None):
+                   mpcat_index=None, asteroid_soa=None):
     data = _recv_msg(conn)
     observations, params = pickle.loads(data)
 
@@ -190,6 +194,7 @@ def _handle_client(conn, asteroids, comets, obscodes, sky_index, n_workers,
         sky_index=sky_index,
         n_workers=n_workers,
         mpcat_index=mpcat_index,
+        asteroid_soa=asteroid_soa,
         **params,
     )
     _send_msg(conn, pickle.dumps(results))

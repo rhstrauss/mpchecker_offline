@@ -101,7 +101,7 @@ class SkyIndex:
         motion_buffer_deg:       float = _DEFAULT_MOTION_BUFFER_DEG,
         motion_rate_deg_per_day: float = _MOTION_RATE_DEG_PER_DAY,
     ) -> 'SkyIndex':
-        from scipy.spatial import KDTree
+        from scipy.spatial import cKDTree
 
         t0 = time.time()
         log.info('Building SkyIndex: %d objects at MJD=%.2f …', len(asteroids), t_ref_mjd)
@@ -135,7 +135,7 @@ class SkyIndex:
             np.sin(dec_r),
         ])
 
-        tree = KDTree(xyz, leafsize=32)
+        tree = cKDTree(xyz, leafsize=32)
         log.info('  SkyIndex built in %.1fs', time.time() - t0)
 
         return cls(
@@ -155,6 +155,7 @@ class SkyIndex:
     # ------------------------------------------------------------------
 
     def save(self, path: Path) -> None:
+        import pickle
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
@@ -168,28 +169,50 @@ class SkyIndex:
             motion_buffer_deg=np.array([self.motion_buffer_deg]),
             motion_rate_deg_per_day=np.array([self.motion_rate_deg_per_day]),
         )
+        pkl_path = path.with_suffix('.pkl')
+        try:
+            with open(pkl_path, 'wb') as f:
+                pickle.dump(self._tree, f, protocol=4)
+        except Exception as exc:
+            log.warning('Failed to save KDTree pickle %s: %s', pkl_path, exc)
         log.info('SkyIndex saved to %s', path)
 
     @classmethod
     def load(cls, path: Path) -> 'SkyIndex':
-        from scipy.spatial import KDTree
+        import pickle
+        from scipy.spatial import cKDTree
 
         t0 = time.time()
+        path = Path(path)
         d = np.load(path)
         ra_deg  = d['ref_ra_deg']
         dec_deg = d['ref_dec_deg']
 
-        ra_r  = ra_deg  * _DEG2RAD
-        dec_r = dec_deg * _DEG2RAD
-        cos_d = np.cos(dec_r)
-        xyz = np.column_stack([
-            cos_d * np.cos(ra_r),
-            cos_d * np.sin(ra_r),
-            np.sin(dec_r),
-        ])
-        tree = KDTree(xyz, leafsize=32)
-        log.info('SkyIndex loaded from %s (KDTree rebuilt in %.1fs)',
-                 path, time.time() - t0)
+        tree = None
+        pkl_path = path.with_suffix('.pkl')
+        if (pkl_path.exists()
+                and pkl_path.stat().st_mtime >= path.stat().st_mtime):
+            try:
+                with open(pkl_path, 'rb') as f:
+                    tree = pickle.load(f)
+                log.info('SkyIndex loaded from %s (KDTree from pickle in %.2fs)',
+                         path, time.time() - t0)
+            except Exception as exc:
+                log.warning('KDTree pickle load failed (%s); rebuilding', exc)
+                tree = None
+
+        if tree is None:
+            ra_r  = ra_deg  * _DEG2RAD
+            dec_r = dec_deg * _DEG2RAD
+            cos_d = np.cos(dec_r)
+            xyz = np.column_stack([
+                cos_d * np.cos(ra_r),
+                cos_d * np.sin(ra_r),
+                np.sin(dec_r),
+            ])
+            tree = cKDTree(xyz, leafsize=32)
+            log.info('SkyIndex loaded from %s (cKDTree rebuilt in %.1fs)',
+                     path, time.time() - t0)
 
         mrate = (float(d['motion_rate_deg_per_day'][0])
                  if 'motion_rate_deg_per_day' in d else _MOTION_RATE_DEG_PER_DAY)
@@ -376,6 +399,7 @@ def get_or_build_index(
             except Exception as exc:
                 log.warning('Dropping corrupt index file %s: %s', npz.name, exc)
                 npz.unlink(missing_ok=True)
+                npz.with_suffix('.pkl').unlink(missing_ok=True)
 
         if snaps:
             multi = MultiSkyIndex(snaps, snapshot_interval)
@@ -389,6 +413,7 @@ def get_or_build_index(
         # Remove stale files before rebuild
         for npz in cache_dir.glob('sky_index_*.npz'):
             npz.unlink(missing_ok=True)
+            npz.with_suffix('.pkl').unlink(missing_ok=True)
 
     # Build fresh snapshots centered on t_now_mjd
     half   = (n_snapshots - 1) / 2.0

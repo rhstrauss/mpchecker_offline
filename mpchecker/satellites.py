@@ -7,6 +7,7 @@ Uses DE440s for planetary positions and planet-specific SPK files for satellites
 
 import logging
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
@@ -45,6 +46,40 @@ _SAT_SPICE_FILES = {
 # Track which kernels are currently loaded
 _loaded_kernels: set = set()
 _spice_base_loaded = False
+
+# Planet proximity pre-filter groups.
+# Each entry: (planet_barycenter_naif_id, frozenset_of_sat_naif_ids, guard_deg)
+# guard_deg is the maximum satellite separation from planet center, plus margin.
+_PLANET_SAT_GROUPS = [
+    (4,  frozenset([401, 402]),           1.0),   # Mars
+    (5,  frozenset(range(501, 573)),      2.5),   # Jupiter
+    (6,  frozenset(range(601, 620)),      2.0),   # Saturn
+    (7,  frozenset(range(701, 720)),      1.0),   # Uranus
+    (8,  frozenset(range(801, 810)),      1.0),   # Neptune
+    (9,  frozenset(range(901, 910)),      0.5),   # Pluto
+]
+
+
+@lru_cache(maxsize=512)
+def _planet_radec_cached(planet_naif_id: int, t_mjd_rounded: float) -> tuple:
+    """Return geocentric (ra_deg, dec_deg) of a planet at t_mjd (J2000).
+    Requires base SPICE kernels already loaded.
+    """
+    import spiceypy as spice
+    _load_base_kernels()
+    et = _mjd_utc_to_et(t_mjd_rounded)
+    try:
+        state, _lt = spice.spkez(planet_naif_id, et, 'J2000', 'LT+S', 399)
+        pos_km = state[:3]
+        dist = float(np.sqrt(pos_km[0]**2 + pos_km[1]**2 + pos_km[2]**2))
+        if dist < 1.0:
+            return (None, None)
+        ux, uy, uz = pos_km[0]/dist, pos_km[1]/dist, pos_km[2]/dist
+        ra_rad  = float(np.arctan2(uy, ux)) % (2.0 * np.pi)
+        dec_rad = float(np.arcsin(max(-1.0, min(1.0, uz))))
+        return (ra_rad * _RAD2DEG, dec_rad * _RAD2DEG)
+    except Exception:
+        return (None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -523,8 +558,30 @@ def check_satellites(
     if naif_ids is None:
         naif_ids = list(SATELLITE_NAIF_IDS.keys())
 
+    # Planet proximity pre-filter: skip entire planet groups whose center
+    # is more than search_radius + guard_deg from the field.
+    active_ids: set = set(naif_ids)
+    t_rounded = round(t_mjd, 2)
     try:
-        positions = get_satellite_positions(naif_ids, t_mjd, obscode, obscodes)
+        for planet_naif, sat_ids, guard_deg in _PLANET_SAT_GROUPS:
+            try:
+                p_ra, p_dec = _planet_radec_cached(planet_naif, t_rounded)
+                if p_ra is None:
+                    continue
+                sep = ang_sep_scalar(p_ra, p_dec, ra_deg, dec_deg)
+                if sep > search_radius_deg + guard_deg:
+                    active_ids -= sat_ids
+            except Exception:
+                pass  # fail-safe: leave group in active set
+    except Exception:
+        active_ids = set(naif_ids)   # full fallback on any unexpected error
+
+    query_ids = [i for i in naif_ids if i in active_ids]
+    if not query_ids:
+        return []
+
+    try:
+        positions = get_satellite_positions(query_ids, t_mjd, obscode, obscodes)
     except Exception as exc:
         log.warning('Satellite check failed: %s', exc)
         return []
