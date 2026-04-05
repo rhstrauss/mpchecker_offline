@@ -560,8 +560,9 @@ def check_satellites(
 
     # Planet proximity pre-filter: skip entire planet groups whose center
     # is more than search_radius + guard_deg from the field.
+    # Round to nearest 0.25 day (6 hours) for good cache hit rate across batches.
     active_ids: set = set(naif_ids)
-    t_rounded = round(t_mjd, 2)
+    t_rounded = round(t_mjd * 4) / 4
     try:
         for planet_naif, sat_ids, guard_deg in _PLANET_SAT_GROUPS:
             try:

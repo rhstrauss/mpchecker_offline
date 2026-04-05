@@ -35,10 +35,11 @@ from .index import SkyIndex, MultiSkyIndex
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Module-level state for fork-based multiprocessing workers (Optimization 4)
+# Module-level state for fork-based multiprocessing workers
 # Set by check_observations before Pool creation; inherited copy-on-write.
 # ---------------------------------------------------------------------------
 _PHASE1_STATE: dict = {}
+_PHASE2_STATE: dict = {}
 
 
 @dataclass
@@ -462,6 +463,135 @@ def _phase1_worker(idx_obs):
     )
 
 
+def _phase2_worker(group_item):
+    """
+    Multiprocessing worker for one obscode group in Phase 2.
+    Reads shared arrays from _PHASE2_STATE (inherited via fork).
+
+    Returns dict {obs_i: list[Match]} for the given obscode group.
+    """
+    import os
+    # Prevent thread oversubscription: each worker runs single-threaded so
+    # N concurrent workers don't saturate the NUMA node.
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+    try:
+        import numba as _nb
+        _nb.set_num_threads(1)
+    except Exception:
+        pass
+
+    import mpchecker.propagator as _prop
+    _prop._init_oorb(force=True)   # clean pyoorb state in this forked worker
+
+    obscode, obs_indices = group_item
+    st            = _PHASE2_STATE
+    asteroids     = st['asteroids']
+    comets        = st['comets']
+    observations  = st['observations']
+    obs_meta      = st['obs_meta']
+    dynmodel      = st['dynmodel']
+    search_rad_deg = st['search_rad_deg']
+    mag_limit     = st['mag_limit']
+    obscodes      = st['obscodes']
+
+    per_obs: dict = {i: [] for i in obs_indices}
+
+    # ---- Asteroids ----
+    all_ast = sorted(set().union(
+        *[set(obs_meta[i]['ast_cands'].tolist()) for i in obs_indices]))
+    if all_ast:
+        all_ast_arr = np.array(all_ast, dtype=np.intp)
+        sub = asteroids[all_ast_arr]
+        orbits = build_oorb_orbits_kep(
+            sub['a'], sub['e'],
+            sub['i']     * _DEG2RAD,
+            sub['Omega'] * _DEG2RAD,
+            sub['omega'] * _DEG2RAD,
+            sub['M']     * _DEG2RAD,
+            sub['epoch'], sub['H'], sub['G'],
+        )
+        t_tts = [obs_meta[i]['t_tt'] for i in obs_indices]
+        eph_batch = oorb_ephemeris_multi_epoch(
+            orbits, t_tts, obscode, dynmodel, obscodes=obscodes)
+
+        for k, obs_i in enumerate(obs_indices):
+            my_cands = obs_meta[obs_i]['ast_cands']
+            if len(my_cands) == 0:
+                continue
+            pos = np.searchsorted(all_ast_arr, my_cands)
+            eph_k = eph_batch[pos, k, :]
+            obs = observations[obs_i]
+            seps = ang_sep_deg(eph_k[:, 1], eph_k[:, 2], obs.ra_deg, obs.dec_deg)
+            within = (seps <= search_rad_deg) & (eph_k[:, 9] <= mag_limit)
+            for j in np.where(within)[0]:
+                idx = my_cands[j]
+                obj = asteroids[idx]
+                per_obs[obs_i].append(Match(
+                    name=obj['desig'],
+                    packed=obj['packed'],
+                    obj_type='minor_planet',
+                    ra_deg=float(eph_k[j, 1]),
+                    dec_deg=float(eph_k[j, 2]),
+                    sep_arcsec=float(seps[j]) * 3600.0,
+                    ra_rate=_rate_to_arcsec_per_hr(float(eph_k[j, 3])),
+                    dec_rate=_rate_to_arcsec_per_hr(float(eph_k[j, 4])),
+                    r_helio=float(eph_k[j, 7]),
+                    delta=float(eph_k[j, 8]),
+                    vmag=float(eph_k[j, 9]),
+                    phase_deg=float(eph_k[j, 5]),
+                    orbit_quality=str(obj['U']).strip(),
+                ))
+
+    # ---- Comets ----
+    all_com = sorted(set().union(
+        *[set(obs_meta[i]['comet_cands'].tolist()) for i in obs_indices]))
+    if all_com:
+        all_com_arr = np.array(all_com, dtype=np.intp)
+        sub_c = comets[all_com_arr]
+        orbits_c = build_oorb_orbits_com(
+            sub_c['q'], sub_c['e'],
+            sub_c['i']     * _DEG2RAD,
+            sub_c['Omega'] * _DEG2RAD,
+            sub_c['omega'] * _DEG2RAD,
+            sub_c['Tp'], sub_c['H'], sub_c['G'],
+        )
+        t_tts = [obs_meta[i]['t_tt'] for i in obs_indices]
+        eph_c_batch = oorb_ephemeris_multi_epoch(
+            orbits_c, t_tts, obscode, dynmodel, obscodes=obscodes)
+
+        for k, obs_i in enumerate(obs_indices):
+            my_cands_c = obs_meta[obs_i]['comet_cands']
+            if len(my_cands_c) == 0:
+                continue
+            pos = np.searchsorted(all_com_arr, my_cands_c)
+            eph_ck = eph_c_batch[pos, k, :]
+            obs = observations[obs_i]
+            seps = ang_sep_deg(eph_ck[:, 1], eph_ck[:, 2], obs.ra_deg, obs.dec_deg)
+            within = (seps <= search_rad_deg) & (eph_ck[:, 9] <= mag_limit)
+            for j in np.where(within)[0]:
+                idx = my_cands_c[j]
+                obj = comets[idx]
+                per_obs[obs_i].append(Match(
+                    name=obj['desig'],
+                    packed=obj['packed'],
+                    obj_type='comet',
+                    ra_deg=float(eph_ck[j, 1]),
+                    dec_deg=float(eph_ck[j, 2]),
+                    sep_arcsec=float(seps[j]) * 3600.0,
+                    ra_rate=_rate_to_arcsec_per_hr(float(eph_ck[j, 3])),
+                    dec_rate=_rate_to_arcsec_per_hr(float(eph_ck[j, 4])),
+                    r_helio=float(eph_ck[j, 7]),
+                    delta=float(eph_ck[j, 8]),
+                    vmag=float(eph_ck[j, 9]),
+                    phase_deg=float(eph_ck[j, 5]),
+                    orbit_quality=str(obj['U']).strip(),
+                ))
+
+    return per_obs
+
+
 # ---------------------------------------------------------------------------
 # Main check function
 # ---------------------------------------------------------------------------
@@ -626,115 +756,131 @@ def check_observations(
         ]
 
     # -----------------------------------------------------------------------
-    # Phase 2: Batched pyoorb — one call per obscode group (Optimization 2).
+    # Phase 2: Batched pyoorb — one call per obscode group.
     # For each group: take union of candidates, run pyoorb at all epochs,
     # then apply per-observation angular + magnitude cuts.
+    # Groups are independent and run in parallel when n_workers > 1.
     # -----------------------------------------------------------------------
-    # Group observation indices by obscode
     by_obscode = defaultdict(list)
     for i, obs in enumerate(observations):
         by_obscode[obs.obscode].append(i)
 
-    for obscode, obs_indices in by_obscode.items():
-        # --- Asteroids ---
-        all_ast = sorted(set().union(
-            *[set(obs_meta[i]['ast_cands'].tolist()) for i in obs_indices]))
-        if all_ast:
-            all_ast = np.array(all_ast, dtype=np.intp)
-            sub = asteroids[all_ast]
-            orbits = build_oorb_orbits_kep(
-                sub['a'], sub['e'],
-                sub['i']     * _DEG2RAD,
-                sub['Omega'] * _DEG2RAD,
-                sub['omega'] * _DEG2RAD,
-                sub['M']     * _DEG2RAD,
-                sub['epoch'], sub['H'], sub['G'],
-            )
-            t_tts = [obs_meta[i]['t_tt'] for i in obs_indices]
-            # Single pyoorb call for all epochs in this obscode group
-            eph_batch = oorb_ephemeris_multi_epoch(orbits, t_tts, obscode, dynmodel,
-                                                   obscodes=obscodes)
-            # eph_batch: [n_union_cands, n_epochs, 11]
+    if n_workers > 1 and len(by_obscode) > 1:
+        import multiprocessing as mp
+        global _PHASE2_STATE
+        _PHASE2_STATE = {
+            'asteroids':     asteroids,
+            'comets':        comets,
+            'observations':  observations,
+            'obs_meta':      obs_meta,
+            'dynmodel':      dynmodel,
+            'search_rad_deg': search_rad_deg,
+            'mag_limit':     mag_limit,
+            'obscodes':      obscodes,
+        }
+        nw2 = min(n_workers, len(by_obscode))
+        ctx2 = mp.get_context('fork')
+        with ctx2.Pool(nw2) as pool2:
+            group_results = pool2.map(_phase2_worker, list(by_obscode.items()))
+        for per_obs in group_results:
+            for obs_i, matches in per_obs.items():
+                results[obs_i].matches.extend(matches)
+    else:
+        for obscode, obs_indices in by_obscode.items():
+            # --- Asteroids ---
+            all_ast = sorted(set().union(
+                *[set(obs_meta[i]['ast_cands'].tolist()) for i in obs_indices]))
+            if all_ast:
+                all_ast = np.array(all_ast, dtype=np.intp)
+                sub = asteroids[all_ast]
+                orbits = build_oorb_orbits_kep(
+                    sub['a'], sub['e'],
+                    sub['i']     * _DEG2RAD,
+                    sub['Omega'] * _DEG2RAD,
+                    sub['omega'] * _DEG2RAD,
+                    sub['M']     * _DEG2RAD,
+                    sub['epoch'], sub['H'], sub['G'],
+                )
+                t_tts = [obs_meta[i]['t_tt'] for i in obs_indices]
+                eph_batch = oorb_ephemeris_multi_epoch(orbits, t_tts, obscode, dynmodel,
+                                                       obscodes=obscodes)
 
-            for k, obs_i in enumerate(obs_indices):
-                my_cands = obs_meta[obs_i]['ast_cands']
-                if len(my_cands) == 0:
-                    continue
-                # Positions of my_cands within all_ast (all_ast is sorted)
-                pos_in_union = np.searchsorted(all_ast, my_cands)
-                eph_k = eph_batch[pos_in_union, k, :]   # [n_my_cands, 11]
+                for k, obs_i in enumerate(obs_indices):
+                    my_cands = obs_meta[obs_i]['ast_cands']
+                    if len(my_cands) == 0:
+                        continue
+                    pos_in_union = np.searchsorted(all_ast, my_cands)
+                    eph_k = eph_batch[pos_in_union, k, :]
 
-                obs = observations[obs_i]
-                seps = ang_sep_deg(eph_k[:, 1], eph_k[:, 2], obs.ra_deg, obs.dec_deg)
-                vmags = eph_k[:, 9]
-                within = (seps <= search_rad_deg) & (vmags <= mag_limit)
+                    obs = observations[obs_i]
+                    seps = ang_sep_deg(eph_k[:, 1], eph_k[:, 2], obs.ra_deg, obs.dec_deg)
+                    within = (seps <= search_rad_deg) & (eph_k[:, 9] <= mag_limit)
 
-                for j in np.where(within)[0]:
-                    idx = my_cands[j]
-                    obj = asteroids[idx]
-                    results[obs_i].matches.append(Match(
-                        name=obj['desig'],
-                        packed=obj['packed'],
-                        obj_type='minor_planet',
-                        ra_deg=float(eph_k[j, 1]),
-                        dec_deg=float(eph_k[j, 2]),
-                        sep_arcsec=float(seps[j]) * 3600.0,
-                        ra_rate=_rate_to_arcsec_per_hr(float(eph_k[j, 3])),
-                        dec_rate=_rate_to_arcsec_per_hr(float(eph_k[j, 4])),
-                        r_helio=float(eph_k[j, 7]),
-                        delta=float(eph_k[j, 8]),
-                        vmag=float(eph_k[j, 9]),
-                        phase_deg=float(eph_k[j, 5]),
-                        orbit_quality=str(obj['U']).strip(),
-                    ))
+                    for j in np.where(within)[0]:
+                        idx = my_cands[j]
+                        obj = asteroids[idx]
+                        results[obs_i].matches.append(Match(
+                            name=obj['desig'],
+                            packed=obj['packed'],
+                            obj_type='minor_planet',
+                            ra_deg=float(eph_k[j, 1]),
+                            dec_deg=float(eph_k[j, 2]),
+                            sep_arcsec=float(seps[j]) * 3600.0,
+                            ra_rate=_rate_to_arcsec_per_hr(float(eph_k[j, 3])),
+                            dec_rate=_rate_to_arcsec_per_hr(float(eph_k[j, 4])),
+                            r_helio=float(eph_k[j, 7]),
+                            delta=float(eph_k[j, 8]),
+                            vmag=float(eph_k[j, 9]),
+                            phase_deg=float(eph_k[j, 5]),
+                            orbit_quality=str(obj['U']).strip(),
+                        ))
 
-        # --- Comets ---
-        all_com = sorted(set().union(
-            *[set(obs_meta[i]['comet_cands'].tolist()) for i in obs_indices]))
-        if all_com:
-            all_com = np.array(all_com, dtype=np.intp)
-            sub_c = comets[all_com]
-            orbits_c = build_oorb_orbits_com(
-                sub_c['q'], sub_c['e'],
-                sub_c['i']     * _DEG2RAD,
-                sub_c['Omega'] * _DEG2RAD,
-                sub_c['omega'] * _DEG2RAD,
-                sub_c['Tp'], sub_c['H'], sub_c['G'],
-            )
-            t_tts = [obs_meta[i]['t_tt'] for i in obs_indices]
-            eph_c_batch = oorb_ephemeris_multi_epoch(orbits_c, t_tts, obscode, dynmodel,
-                                                     obscodes=obscodes)
+            # --- Comets ---
+            all_com = sorted(set().union(
+                *[set(obs_meta[i]['comet_cands'].tolist()) for i in obs_indices]))
+            if all_com:
+                all_com = np.array(all_com, dtype=np.intp)
+                sub_c = comets[all_com]
+                orbits_c = build_oorb_orbits_com(
+                    sub_c['q'], sub_c['e'],
+                    sub_c['i']     * _DEG2RAD,
+                    sub_c['Omega'] * _DEG2RAD,
+                    sub_c['omega'] * _DEG2RAD,
+                    sub_c['Tp'], sub_c['H'], sub_c['G'],
+                )
+                t_tts = [obs_meta[i]['t_tt'] for i in obs_indices]
+                eph_c_batch = oorb_ephemeris_multi_epoch(orbits_c, t_tts, obscode, dynmodel,
+                                                         obscodes=obscodes)
 
-            for k, obs_i in enumerate(obs_indices):
-                my_cands_c = obs_meta[obs_i]['comet_cands']
-                if len(my_cands_c) == 0:
-                    continue
-                pos_in_union = np.searchsorted(all_com, my_cands_c)
-                eph_ck = eph_c_batch[pos_in_union, k, :]
+                for k, obs_i in enumerate(obs_indices):
+                    my_cands_c = obs_meta[obs_i]['comet_cands']
+                    if len(my_cands_c) == 0:
+                        continue
+                    pos_in_union = np.searchsorted(all_com, my_cands_c)
+                    eph_ck = eph_c_batch[pos_in_union, k, :]
 
-                obs = observations[obs_i]
-                seps = ang_sep_deg(eph_ck[:, 1], eph_ck[:, 2], obs.ra_deg, obs.dec_deg)
-                vmags = eph_ck[:, 9]
-                within = (seps <= search_rad_deg) & (vmags <= mag_limit)
+                    obs = observations[obs_i]
+                    seps = ang_sep_deg(eph_ck[:, 1], eph_ck[:, 2], obs.ra_deg, obs.dec_deg)
+                    within = (seps <= search_rad_deg) & (eph_ck[:, 9] <= mag_limit)
 
-                for j in np.where(within)[0]:
-                    idx = my_cands_c[j]
-                    obj = comets[idx]
-                    results[obs_i].matches.append(Match(
-                        name=obj['desig'],
-                        packed=obj['packed'],
-                        obj_type='comet',
-                        ra_deg=float(eph_ck[j, 1]),
-                        dec_deg=float(eph_ck[j, 2]),
-                        sep_arcsec=float(seps[j]) * 3600.0,
-                        ra_rate=_rate_to_arcsec_per_hr(float(eph_ck[j, 3])),
-                        dec_rate=_rate_to_arcsec_per_hr(float(eph_ck[j, 4])),
-                        r_helio=float(eph_ck[j, 7]),
-                        delta=float(eph_ck[j, 8]),
-                        vmag=float(eph_ck[j, 9]),
-                        phase_deg=float(eph_ck[j, 5]),
-                        orbit_quality=str(obj['U']).strip(),
-                    ))
+                    for j in np.where(within)[0]:
+                        idx = my_cands_c[j]
+                        obj = comets[idx]
+                        results[obs_i].matches.append(Match(
+                            name=obj['desig'],
+                            packed=obj['packed'],
+                            obj_type='comet',
+                            ra_deg=float(eph_ck[j, 1]),
+                            dec_deg=float(eph_ck[j, 2]),
+                            sep_arcsec=float(seps[j]) * 3600.0,
+                            ra_rate=_rate_to_arcsec_per_hr(float(eph_ck[j, 3])),
+                            dec_rate=_rate_to_arcsec_per_hr(float(eph_ck[j, 4])),
+                            r_helio=float(eph_ck[j, 7]),
+                            delta=float(eph_ck[j, 8]),
+                            vmag=float(eph_ck[j, 9]),
+                            phase_deg=float(eph_ck[j, 5]),
+                            orbit_quality=str(obj['U']).strip(),
+                        ))
 
     # -----------------------------------------------------------------------
     # Phase 3: Planetary satellite check (per-observation, no batching needed)

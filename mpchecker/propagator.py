@@ -904,12 +904,57 @@ def oorb_ephemeris_multi_epoch(
 
     pyoorb is always called with geocenter ('500'); topocentric correction is
     applied via _apply_topocentric_correction when obscodes is provided.
+
+    Large batches are split proactively at _OORB_BATCH_MAX orbits to avoid
+    pyoorb's internal batch-size limit (error 35) without triggering the
+    expensive error-path reinit cycle.
     """
     import pyoorb as oo
-    _init_oorb()
+    # Force reinit before every call: resets pyoorb's internal integrator state
+    # (step-size caches, error estimates) that accumulate across obscode groups
+    # and trigger spurious error 35 / NaN failures for close-approach orbits.
+    _init_oorb(force=True)
 
     n_epochs = len(t_mjd_list)
     epochs = np.array([[t, 3] for t in t_mjd_list], dtype=np.double, order='F')
+
+    n = len(orbits)
+    if n > _OORB_BATCH_MAX:
+        # Split proactively to stay below pyoorb's internal orbit-count limit.
+        result = np.full((n, n_epochs, 11), np.nan)
+        result[:, :, 9] = 99.0
+        for start in range(0, n, _OORB_BATCH_MAX):
+            chunk = orbits[start:start + _OORB_BATCH_MAX]
+            _init_oorb(force=True)   # clean state between chunks
+            chunk_result = _oorb_multi_epoch_chunk(chunk, epochs, dynmodel)
+            result[start:start + len(chunk)] = chunk_result
+        if obscodes is not None:
+            result = _apply_topocentric_correction(result, t_mjd_list, obscode, obscodes)
+        return result
+
+    result = _oorb_multi_epoch_chunk(orbits, epochs, dynmodel)
+    if obscodes is not None:
+        result = _apply_topocentric_correction(result, t_mjd_list, obscode, obscodes)
+    return result
+
+
+# Proactive orbit batch cap — pyoorb error 35 observed at ~1800 orbits;
+# stay well below with headroom for future epoch-count interactions.
+_OORB_BATCH_MAX = 800
+
+
+def _oorb_multi_epoch_chunk(
+    orbits: np.ndarray,
+    epochs: np.ndarray,
+    dynmodel: str,
+) -> np.ndarray:
+    """
+    Single pyoorb call for ≤_OORB_BATCH_MAX orbits × all epochs.
+    Falls back to 50-orbit sub-batches then one-by-one on error.
+    """
+    import pyoorb as oo
+    n = len(orbits)
+    n_epochs = epochs.shape[0]
 
     eph, err = oo.pyoorb.oorb_ephemeris_basic(
         in_orbits=orbits,
@@ -918,24 +963,18 @@ def oorb_ephemeris_multi_epoch(
         in_dynmodel=dynmodel,
     )
     if err == 0:
-        if obscodes is not None:
-            eph = _apply_topocentric_correction(eph, t_mjd_list, obscode, obscodes)
-        return eph  # [n_orbits, n_epochs, 11]
+        return eph  # [n, n_epochs, 11]
 
-    # Non-zero error: split into sub-batches and retry.
-    # The batch may have failed because: (a) too many orbits (pyoorb internal
-    # limit, error 35), or (b) a corrupted integrator state. Re-initialise
-    # before retrying so that close-approach orbits (which fail silently when
-    # state is dirty) are processed correctly.
-    log.warning('pyoorb multi-epoch batch error %d; retrying %d orbits in sub-batches',
-                err, len(orbits))
+    # Unexpected error (dirty integrator state, bad orbits, etc.). Reinit and
+    # fall back to 50-orbit chunks; then one-by-one for persistent failures.
+    log.warning('pyoorb multi-epoch chunk error %d for %d orbits; falling back',
+                err, n)
     _init_oorb(force=True)
-    _SUBBATCH = 200   # well below pyoorb's internal limit
-    n = len(orbits)
     result = np.full((n, n_epochs, 11), np.nan)
     result[:, :, 9] = 99.0
-    for start in range(0, n, _SUBBATCH):
-        chunk = orbits[start:start + _SUBBATCH]
+    _FALLBACK = 50
+    for start in range(0, n, _FALLBACK):
+        chunk = orbits[start:start + _FALLBACK]
         try:
             e2, err2 = oo.pyoorb.oorb_ephemeris_basic(
                 in_orbits=chunk,
@@ -946,7 +985,6 @@ def oorb_ephemeris_multi_epoch(
             if err2 == 0:
                 result[start:start + len(chunk)] = e2
             else:
-                # Sub-batch also failed: retry one-by-one within this chunk
                 _init_oorb(force=True)
                 for j in range(len(chunk)):
                     try:
@@ -962,8 +1000,6 @@ def oorb_ephemeris_multi_epoch(
                         pass
         except Exception:
             pass
-    if obscodes is not None:
-        result = _apply_topocentric_correction(result, t_mjd_list, obscode, obscodes)
     return result
 
 
