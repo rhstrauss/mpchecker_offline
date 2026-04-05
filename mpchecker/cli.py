@@ -87,8 +87,18 @@ def format_identifications(identifications, observations,
             'ephemeris':  'catalog orbit (pyoorb)',
             'orbit_fit':  'fo orbit fit',
         }.get(ident.method, ident.method)
+
+        # Name: use match.name when available; for orbit_fit-only fall back to
+        # catalog element-similarity hit or "unknown"
+        if m is not None:
+            display_name = m.name
+        elif ident.fo_catalog_name:
+            display_name = ident.fo_catalog_name
+        else:
+            display_name = 'unknown'
+
         lines.append(
-            f'\n [{rank}] {m.name}  [{method_label}]'
+            f'\n [{rank}] {display_name}  [{method_label}]'
             f'  RMS = {ident.rms_arcsec:.2f}"'
         )
         # Show individual residuals (truncate if very many observations)
@@ -100,7 +110,7 @@ def format_identifications(identifications, observations,
             last2  = '  '.join(f'{r:.2f}"' for r in resids[-2:])
             resid_str = f'{first6}  …  {last2}  (n={len(resids)})'
         lines.append(f'     O-C per obs: {resid_str}')
-        if ident.method == 'ephemeris':
+        if ident.method == 'ephemeris' and m is not None:
             lines.append(
                 f'     Catalog: V={m.vmag:.1f}  sep={m.sep_arcsec:.1f}"  '
                 f'r={m.r_helio:.3f} AU  Δ={m.delta:.3f} AU  phase={m.phase_deg:.1f}°'
@@ -113,6 +123,12 @@ def format_identifications(identifications, observations,
                 f'i={float(el["i"][0]):.2f}°  '
                 f'epoch MJD {float(el["epoch"][0]):.1f}'
             )
+            if ident.fo_catalog_name and ident.fo_catalog_score is not None:
+                score_str = f'{ident.fo_catalog_score:.4f}'
+                lines.append(
+                    f'     Catalog match (Δ-elements): {ident.fo_catalog_name}'
+                    f'  (score={score_str})'
+                )
     lines.append('')
     return '\n'.join(lines)
 
@@ -492,6 +508,17 @@ def main(argv=None):
     if not observations:
         print('No valid observations found in input.', file=sys.stderr)
         return 1
+
+    # --dedup + --identify are incompatible: dedup collapses every tracklet to
+    # 1 observation, making orbit identification impossible (need >= 2 obs).
+    if args.dedup and args.identify:
+        print(
+            'WARNING: --identify and --dedup are incompatible. '
+            '--dedup reduces each tracklet to 1 observation; '
+            'identify_tracklet requires at least 2 observations per cluster.\n'
+            'Remove --dedup to enable identification.',
+            file=sys.stderr,
+        )
 
     # --dedup: keep only the first observation per packed designation
     if args.dedup:

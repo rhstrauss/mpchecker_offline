@@ -26,6 +26,7 @@ from .propagator import (
     kep_to_radec, ang_sep_deg, get_observer_helio, get_planet_helio,
     build_oorb_orbits_kep, build_oorb_orbits_com,
     oorb_ephemeris_multi_epoch, reepoch_high_e_asteroids,
+    _init_oorb,
     _DEG2RAD, _RAD2DEG,
 )
 from .satellites import check_satellites, check_dwarf_planet_satellites
@@ -78,22 +79,29 @@ class Identification:
 
     Fields
     ------
-    match       : the candidate, as it appeared in Phase 2 results
-    residuals   : per-observation O-C in arcsec (same order as input observations)
-    rms_arcsec  : RMS of residuals across all input observations
-    n_obs       : total number of input observations
-    method      : 'ephemeris'  — residuals computed from catalog orbit via pyoorb
-                  'orbit_fit'  — independent orbit fit to input obs via fo;
-                                 residuals are O-C from the fo solution
-    fo_elements : fitted orbit (1-element ASTEROID_DTYPE array); only set when
-                  method='orbit_fit'
+    match            : the candidate, as it appeared in Phase 2 results; None
+                       when no Phase 2 candidate was found (orbit_fit only)
+    residuals        : per-observation O-C in arcsec (same order as input obs)
+    rms_arcsec       : RMS of residuals across all input observations
+    n_obs            : total number of input observations
+    method           : 'ephemeris'  — residuals from catalog orbit via pyoorb
+                       'orbit_fit'  — independent orbit fit via fo; residuals
+                                      are O-C from the fo solution
+    fo_elements      : fitted orbit (1-element ASTEROID_DTYPE array); only set
+                       when method='orbit_fit'
+    fo_catalog_name  : best catalog match by (a, e, i) element similarity; set
+                       when method='orbit_fit' and a match is found in MPCORB
+    fo_catalog_score : orbital element similarity score for fo_catalog_name
+                       (dimensionless; smaller is better)
     """
-    match:       Match
-    residuals:   List[float]
-    rms_arcsec:  float
-    n_obs:       int
-    method:      str
-    fo_elements: Optional[np.ndarray] = None
+    match:            Optional[Match]
+    residuals:        List[float]
+    rms_arcsec:       float
+    n_obs:            int
+    method:           str
+    fo_elements:      Optional[np.ndarray] = None
+    fo_catalog_name:  Optional[str]        = None
+    fo_catalog_score: Optional[float]      = None
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +704,51 @@ def check_observations(
 # Tracklet identification
 # ---------------------------------------------------------------------------
 
+def _find_catalog_match_by_elements(
+    fo_arr: np.ndarray,
+    asteroids: np.ndarray,
+    threshold: float = 0.05,
+) -> tuple:
+    """
+    Find the best-matching catalog object for a fo-fitted orbit using (a, e, i)
+    orbital element similarity.
+
+    The similarity score is:
+        score = |Δa| + |Δe| + |Δi°| / 10
+
+    This is insensitive to epoch differences because a, e, i change very
+    little between observations and catalog epochs (even across close
+    approaches at 0.056 AU, Δa < 0.01 AU).
+
+    Parameters
+    ----------
+    fo_arr    : 1-element ASTEROID_DTYPE array from refit_from_obs()
+    asteroids : full MPCORB structured array
+    threshold : maximum score to accept a match (default: 0.05)
+
+    Returns
+    -------
+    (name, packed, score) if a match is found; (None, None, None) otherwise.
+    """
+    a_fo = float(fo_arr['a'][0])
+    e_fo = float(fo_arr['e'][0])
+    i_fo = float(fo_arr['i'][0])
+
+    da = np.abs(asteroids['a'] - a_fo)
+    de = np.abs(asteroids['e'] - e_fo)
+    di = np.abs(asteroids['i'] - i_fo)
+    score = da + de + di / 10.0
+
+    best_idx   = int(np.argmin(score))
+    best_score = float(score[best_idx])
+
+    if best_score < threshold:
+        name   = str(asteroids['desig'][best_idx]).strip()
+        packed = str(asteroids['packed'][best_idx]).strip()
+        return name, packed, best_score
+    return None, None, None
+
+
 def identify_tracklet(
     observations: List[Observation],
     results: List[CheckResult],
@@ -772,7 +825,9 @@ def identify_tracklet(
     if not qualifying:
         log.debug('identify_tracklet: no candidates appeared in >= %d/%d observations',
                   threshold, n_obs)
-        return []
+        if not fo_fit:
+            return []
+        # fo_fit=True: still try a blind orbit fit even without Phase 2 candidates
 
     # ---- Pre-compute TT epochs; group by obscode for batched pyoorb calls ----
     t_tts      = [_utc_to_tt_mjd(obs.epoch_mjd) for obs in observations]
@@ -782,15 +837,24 @@ def identify_tracklet(
 
     identifications: List[Identification] = []
 
-    # ---- Ephemeris method: O-C from catalog orbit for each qualifying candidate ----
+    # ---- Ephemeris method: batch pyoorb across ALL qualifying candidates ----
+    #
+    # Phase 2 calls pyoorb once per obscode group with a BATCH of orbits; calling
+    # it one-by-one for each candidate causes single-orbit N-body failures for
+    # close-approach objects (they work fine in a batch but fail alone).
+    # Replicate the Phase 2 batching pattern here.
+
+    # 1. Build orbit arrays for all qualifying candidates
+    cand_orbits:   List[np.ndarray] = []   # parallel to valid_qualifying
+    valid_qualifying: List[tuple]   = []   # (packed, obj_type)
     for packed, obj_type in qualifying:
         try:
             if obj_type == 'minor_planet':
                 idx = np.where(asteroids['packed'] == packed)[0]
                 if not len(idx):
                     continue
-                sub   = asteroids[idx[:1]]
-                orbit = build_oorb_orbits_kep(
+                sub = asteroids[idx[:1]]
+                orb = build_oorb_orbits_kep(
                     sub['a'], sub['e'],
                     sub['i']     * _DEG2RAD, sub['Omega'] * _DEG2RAD,
                     sub['omega'] * _DEG2RAD, sub['M']     * _DEG2RAD,
@@ -800,8 +864,8 @@ def identify_tracklet(
                 idx = np.where(comets['packed'] == packed)[0]
                 if not len(idx):
                     continue
-                sub   = comets[idx[:1]]
-                orbit = build_oorb_orbits_com(
+                sub = comets[idx[:1]]
+                orb = build_oorb_orbits_com(
                     sub['q'], sub['e'],
                     sub['i']     * _DEG2RAD, sub['Omega'] * _DEG2RAD,
                     sub['omega'] * _DEG2RAD, sub['Tp'],
@@ -809,36 +873,73 @@ def identify_tracklet(
                 )
             else:
                 continue
+            cand_orbits.append(orb)
+            valid_qualifying.append((packed, obj_type))
         except Exception as exc:
             log.debug('identify_tracklet: orbit build failed for %s: %s', packed, exc)
-            continue
 
-        # Compute pyoorb ephemeris at every input observation epoch
-        obs_residuals: List[float] = [np.inf] * n_obs
-        try:
-            for obscode, obs_indices in by_obscode.items():
-                epoch_tts = [t_tts[i] for i in obs_indices]
-                eph = oorb_ephemeris_multi_epoch(orbit, epoch_tts, obscode, dynmodel,
-                                                  obscodes=obscodes)
-                # eph shape: [1, n_epochs, 11]; col 1=RA, col 2=Dec
-                for k, obs_i in enumerate(obs_indices):
-                    obs = observations[obs_i]
-                    sep = ang_sep_deg(float(eph[0, k, 1]), float(eph[0, k, 2]),
-                                      obs.ra_deg, obs.dec_deg) * 3600.0
-                    obs_residuals[obs_i] = sep
-        except Exception as exc:
-            log.debug('identify_tracklet: ephemeris failed for %s: %s', packed, exc)
-            continue
+    if not valid_qualifying:
+        pass   # fall through to fo_fit block
+    else:
+        # 2. Stack all orbits with consecutive IDs (required by pyoorb)
+        n_cands = len(valid_qualifying)
+        batch_orbits = np.vstack(cand_orbits)
+        batch_orbits[:, 0] = np.arange(1, n_cands + 1)
 
-        if all(r <= residual_threshold_arcsec for r in obs_residuals):
-            rms = float(np.sqrt(np.mean(np.array(obs_residuals) ** 2)))
-            identifications.append(Identification(
-                match=best_match[(packed, obj_type)],
-                residuals=list(obs_residuals),
-                rms_arcsec=rms,
-                n_obs=n_obs,
-                method='ephemeris',
-            ))
+        # 3. Per-candidate residual arrays
+        all_residuals = [[np.inf] * n_obs for _ in range(n_cands)]
+
+        # 4. One pyoorb batch call per obscode group.
+        # Force pyoorb re-init: after heavy Phase 2 use the N-body integrator
+        # accumulates internal state (step-size caches) that makes it return NaN
+        # for close-approach orbits.  Re-calling oorb_init resets this state.
+        _init_oorb(force=True)
+        for obscode, obs_indices in by_obscode.items():
+            epoch_tts = [t_tts[i] for i in obs_indices]
+            try:
+                eph = oorb_ephemeris_multi_epoch(
+                    batch_orbits, epoch_tts, obscode, dynmodel, obscodes=obscodes)
+                # eph shape: [n_cands, n_epochs, 11]
+                for ci in range(n_cands):
+                    for k, obs_i in enumerate(obs_indices):
+                        obs = observations[obs_i]
+                        ra_pred  = float(eph[ci, k, 1])
+                        dec_pred = float(eph[ci, k, 2])
+                        if np.isfinite(ra_pred) and np.isfinite(dec_pred):
+                            sep = ang_sep_deg(ra_pred, dec_pred,
+                                              obs.ra_deg, obs.dec_deg) * 3600.0
+                            all_residuals[ci][obs_i] = sep
+            except Exception as exc:
+                log.debug('identify_tracklet: batch ephemeris failed for obscode %s: %s',
+                          obscode, exc)
+
+        # 5. Evaluate each candidate
+        for ci, (packed, obj_type) in enumerate(valid_qualifying):
+            obs_residuals = all_residuals[ci]
+            finite = [r for r in obs_residuals if np.isfinite(r)]
+            if not finite:
+                continue
+            rms = float(np.sqrt(np.mean(np.array(finite) ** 2)))
+            # Use RMS rather than per-observation max: catalog-orbit errors
+            # for close-approach NEOs grow systematically across a multi-night
+            # arc, so individual far-end observations often exceed the threshold
+            # even for genuine identifications.  Guard against extreme single-obs
+            # outliers with a 4× ceiling.
+            max_resid = float(max(finite))
+            if rms <= residual_threshold_arcsec and max_resid <= residual_threshold_arcsec * 4:
+                identifications.append(Identification(
+                    match=best_match[(packed, obj_type)],
+                    residuals=obs_residuals,
+                    rms_arcsec=rms,
+                    n_obs=n_obs,
+                    method='ephemeris',
+                ))
+            else:
+                log.debug(
+                    'identify_tracklet: %s (%s) — RMS=%.1f" max=%.1f" '
+                    '(threshold=%.1f"); not reported',
+                    packed, obj_type, rms, max_resid, residual_threshold_arcsec,
+                )
 
     identifications.sort(key=lambda x: x.rms_arcsec)
 
@@ -876,18 +977,51 @@ def identify_tracklet(
 
                     if all(r < np.inf for r in fo_residuals):
                         fo_rms = float(np.sqrt(np.mean(np.array(fo_residuals) ** 2)))
-                        # Attach to best ephemeris identification (if any)
-                        anchor = identifications[0].match if identifications else (
-                            best_match[qualifying[0]] if qualifying else None)
-                        if anchor is not None:
-                            identifications.append(Identification(
-                                match=anchor,
-                                residuals=list(fo_residuals),
-                                rms_arcsec=fo_rms,
-                                n_obs=n_obs,
-                                method='orbit_fit',
-                                fo_elements=fo_orbit,
-                            ))
+                        # Anchor: prefer best ephemeris match; fall back to
+                        # Phase 2 candidate; or None when fo-only (no Phase 2).
+                        anchor = (identifications[0].match if identifications else
+                                  (best_match[qualifying[0]] if qualifying else None))
+
+                        # Catalog match by orbital element similarity (covers the
+                        # close-approach NEO case where no Phase 2 candidate was found)
+                        cat_name, cat_packed, cat_score = _find_catalog_match_by_elements(
+                            fo_orbit, asteroids)
+
+                        # If fo embedded a real designation in desig[] (not temp),
+                        # prefer that over element-similarity result
+                        fo_desig = str(fo_orbit['desig'][0]).strip()
+                        if fo_desig and fo_desig not in ('ZMPCK', ''):
+                            # fo self-identified the object; try to find it in catalog
+                            idx = np.where(
+                                (asteroids['desig'] == fo_desig) |
+                                (asteroids['packed'] == fo_desig)
+                            )[0]
+                            if len(idx):
+                                cat_name   = str(asteroids['desig'][idx[0]]).strip()
+                                cat_packed = str(asteroids['packed'][idx[0]]).strip()
+                                cat_score  = 0.0
+                            else:
+                                # fo named something not in our catalog
+                                cat_name  = fo_desig
+                                cat_score = 0.0
+
+                        log.info(
+                            'identify_tracklet: fo fit RMS=%.2f"  catalog match: %s (score=%.4f)',
+                            fo_rms,
+                            cat_name or 'none',
+                            cat_score if cat_score is not None else float('nan'),
+                        )
+
+                        identifications.append(Identification(
+                            match=anchor,
+                            residuals=list(fo_residuals),
+                            rms_arcsec=fo_rms,
+                            n_obs=n_obs,
+                            method='orbit_fit',
+                            fo_elements=fo_orbit,
+                            fo_catalog_name=cat_name,
+                            fo_catalog_score=cat_score,
+                        ))
         except Exception as exc:
             log.debug('identify_tracklet: fo fit failed: %s', exc)
 

@@ -51,12 +51,14 @@ def _fo_available() -> bool:
     return shutil.which('fo') is not None
 
 
-def _parse_fo_json(json_path: Path) -> Optional[dict]:
+def _parse_fo_json(json_path: Path):
     """
-    Read a fo output JSON file and return the element dict for the best solution.
+    Read a fo output JSON file and return (designation_key, element_dict) for
+    the best solution.
 
-    When fo produces multi-arc solutions (e.g. 'ObjW' designations for weaker arcs),
-    prefer the solution with the most residuals (largest observation arc).
+    When fo produces multi-arc solutions (e.g. 'ObjW' designations for weaker
+    arcs), prefer the solution with the most residuals (largest observation arc).
+    Returns None on failure.
     """
     try:
         with open(json_path) as f:
@@ -65,9 +67,11 @@ def _parse_fo_json(json_path: Path) -> Optional[dict]:
         if not objects:
             return None
         # Return solution with most n_resids (primary arc)
-        best = max(objects.values(),
-                   key=lambda v: v.get('elements', {}).get('n_resids', 0))
-        return best['elements']
+        best_key, best_val = max(
+            objects.items(),
+            key=lambda kv: kv[1].get('elements', {}).get('n_resids', 0),
+        )
+        return best_key, best_val['elements']
     except Exception as exc:
         log.debug('Failed to parse fo JSON %s: %s', json_path, exc)
         return None
@@ -152,8 +156,9 @@ def refit_neo(
         cache_path = cache_dir / cache_key
         if cache_path.exists():
             try:
-                el = _parse_fo_json(cache_path)
-                if el is not None:
+                parsed = _parse_fo_json(cache_path)
+                if parsed is not None:
+                    _, el = parsed
                     return _elements_to_array(el, packed)
             except Exception:
                 pass
@@ -223,9 +228,10 @@ def refit_neo(
             log.warning('fo produced no output JSON for %s', packed)
             return None
 
-        el = _parse_fo_json(json_path)
-        if el is None:
+        parsed = _parse_fo_json(json_path)
+        if parsed is None:
             return None
+        _, el = parsed
 
         # ---- Cache result ----
         if cache_path is not None:
@@ -449,11 +455,18 @@ def refit_from_obs(
                 log.debug('refit_from_obs: fo produced no output JSON')
                 return None
 
-            el = _parse_fo_json(json_path)
-            if el is None:
+            parsed = _parse_fo_json(json_path)
+            if parsed is None:
                 return None
+            fo_key, el = parsed
 
-            return _elements_to_array(el, temp_desig)
+            arr = _elements_to_array(el, temp_desig)
+            if arr is not None:
+                # If fo identified a real object (key differs from our temp desig),
+                # record it in desig so identify_tracklet can look it up.
+                if fo_key and fo_key != temp_desig:
+                    arr['desig'][0] = fo_key[:20]
+            return arr
 
         except subprocess.TimeoutExpired:
             log.debug('refit_from_obs: fo timed out (%ds)', timeout_sec)

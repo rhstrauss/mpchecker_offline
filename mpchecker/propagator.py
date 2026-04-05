@@ -606,9 +606,19 @@ def phase_angle(obj_helio: np.ndarray,
 _OORB_INIT = False
 
 
-def _init_oorb():
+def _init_oorb(force: bool = False):
+    """Initialise (or re-initialise) the pyoorb library.
+
+    Parameters
+    ----------
+    force : if True, call oorb_init even if pyoorb was already initialised.
+            Needed after heavy N-body use: the integrator accumulates internal
+            state (step-size caches, error estimates) that can make single-orbit
+            N-body calls fail with NaN for close-approach objects.  Forcing a
+            re-init resets this state without affecting cached catalog data.
+    """
     global _OORB_INIT
-    if _OORB_INIT:
+    if _OORB_INIT and not force:
         return
     import pyoorb as oo
     from .config import OORB_EPHEM
@@ -617,7 +627,8 @@ def _init_oorb():
         raise FileNotFoundError(f'pyoorb ephemeris not found: {ephem}')
     oo.pyoorb.oorb_init(ephem)
     _OORB_INIT = True
-    log.info('pyoorb initialized with %s', ephem)
+    if not force:
+        log.info('pyoorb initialized with %s', ephem)
 
 
 def build_oorb_orbits_kep(
