@@ -385,13 +385,13 @@ def refit_from_obs(
     observations: list,
     temp_desig: str = 'ZMPCK',
     timeout_sec: int = 60,
-) -> Optional[np.ndarray]:
+):
     """
     Fit an orbit to the input observations using fo (find_orb).
 
     All observations are formatted as MPC 80-column with a temporary designation
     so fo treats them as a single tracklet.  The fitted orbital elements are
-    returned as a 1-element ASTEROID_DTYPE numpy structured array.
+    returned together with a quality dict extracted directly from fo's JSON output.
 
     This is used by identify_tracklet() to independently verify that the input
     observations are self-consistent with a physical orbit (the 'orbit_fit'
@@ -406,8 +406,17 @@ def refit_from_obs(
 
     Returns
     -------
-    1-element numpy structured array (ASTEROID_DTYPE) with fitted elements,
-    or None if fo is unavailable, fewer than 3 valid lines are produced,
+    (arr, quality) tuple where:
+      arr     : 1-element numpy structured array (ASTEROID_DTYPE) with fitted elements
+      quality : dict with keys:
+                  rms_arcsec          — fo's own RMS residual (arcsec); reliable even
+                                        for close-approach objects where pyoorb diverges
+                  rms_arcsec_weighted — weighted RMS from fo
+                  n_obs               — number of observations used in fo fit
+                  earth_moid_au       — Earth MOID (AU) from fo solution
+                  a_sigma, e_sigma, i_sigma — 1-sigma element uncertainties
+
+    Returns None if fo is unavailable, fewer than 3 valid lines are produced,
     or the fit fails / times out.
     """
     if not _fo_available():
@@ -461,12 +470,27 @@ def refit_from_obs(
             fo_key, el = parsed
 
             arr = _elements_to_array(el, temp_desig)
-            if arr is not None:
-                # If fo identified a real object (key differs from our temp desig),
-                # record it in desig so identify_tracklet can look it up.
-                if fo_key and fo_key != temp_desig:
-                    arr['desig'][0] = fo_key[:20]
-            return arr
+            if arr is None:
+                return None
+
+            # If fo identified a real object (key differs from our temp desig),
+            # record it in desig so identify_tracklet can look it up.
+            if fo_key and fo_key != temp_desig:
+                arr['desig'][0] = fo_key[:20]
+
+            # Extract quality metrics directly from fo's JSON elements dict.
+            # rms_residual is fo's own fit residual in arcseconds — much more
+            # reliable than pyoorb re-evaluation for close-approach NEOs.
+            quality = {
+                'rms_arcsec':          float(el.get('rms_residual',          float('nan'))),
+                'rms_arcsec_weighted': float(el.get('weighted_rms_residual', float('nan'))),
+                'n_obs':               int(el.get('n_resids', 0)),
+                'earth_moid_au':       float(el.get('MOIDs', {}).get('Earth', float('nan'))),
+                'a_sigma':             float(el.get('a sigma', float('nan'))),
+                'e_sigma':             float(el.get('e sigma', float('nan'))),
+                'i_sigma':             float(el.get('i sigma', float('nan'))),
+            }
+            return arr, quality
 
         except subprocess.TimeoutExpired:
             log.debug('refit_from_obs: fo timed out (%ds)', timeout_sec)

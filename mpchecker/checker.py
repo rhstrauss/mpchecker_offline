@@ -44,18 +44,19 @@ _PHASE1_STATE: dict = {}
 @dataclass
 class Match:
     """A single matched object for one observation."""
-    name:        str
-    packed:      str
-    obj_type:    str          # 'minor_planet', 'comet', 'satellite'
-    ra_deg:      float        # predicted RA (degrees)
-    dec_deg:     float        # predicted Dec (degrees)
-    sep_arcsec:  float        # angular separation (arcsec)
-    ra_rate:     float        # dRA*cos(Dec) (arcsec/hr)
-    dec_rate:    float        # dDec (arcsec/hr)
-    r_helio:     float        # heliocentric distance (AU)
-    delta:       float        # geocentric distance (AU)
-    vmag:        float        # predicted V magnitude
-    phase_deg:   float        # phase angle (degrees)
+    name:          str
+    packed:        str
+    obj_type:      str          # 'minor_planet', 'comet', 'satellite'
+    ra_deg:        float        # predicted RA (degrees)
+    dec_deg:       float        # predicted Dec (degrees)
+    sep_arcsec:    float        # angular separation (arcsec)
+    ra_rate:       float        # dRA*cos(Dec) (arcsec/hr)
+    dec_rate:      float        # dDec (arcsec/hr)
+    r_helio:       float        # heliocentric distance (AU)
+    delta:         float        # geocentric distance (AU)
+    vmag:          float        # predicted V magnitude
+    phase_deg:     float        # phase angle (degrees)
+    orbit_quality: str  = ''    # MPC U parameter ('0'–'9', 'E', 'D', …); '' for satellites
 
 
 @dataclass
@@ -102,6 +103,9 @@ class Identification:
     fo_elements:      Optional[np.ndarray] = None
     fo_catalog_name:  Optional[str]        = None
     fo_catalog_score: Optional[float]      = None
+    fo_rms_internal:  Optional[float]      = None   # fo's own RMS (arcsec); reliable for close-approach objects
+    fo_n_obs:         Optional[int]        = None   # observations used in fo fit
+    fo_earth_moid_au: Optional[float]      = None   # Earth MOID from fo solution (AU)
 
 
 # ---------------------------------------------------------------------------
@@ -590,6 +594,7 @@ def check_observations(
                         delta=float(eph_k[j, 8]),
                         vmag=float(eph_k[j, 9]),
                         phase_deg=float(eph_k[j, 5]),
+                        orbit_quality=str(obj['U']).strip(),
                     ))
 
         # --- Comets ---
@@ -637,6 +642,7 @@ def check_observations(
                         delta=float(eph_ck[j, 8]),
                         vmag=float(eph_ck[j, 9]),
                         phase_deg=float(eph_ck[j, 5]),
+                        orbit_quality=str(obj['U']).strip(),
                     ))
 
     # -----------------------------------------------------------------------
@@ -878,6 +884,12 @@ def identify_tracklet(
         except Exception as exc:
             log.debug('identify_tracklet: orbit build failed for %s: %s', packed, exc)
 
+    # Force pyoorb re-init unconditionally: after heavy Phase 2 use the N-body
+    # integrator accumulates internal state (step-size caches) that causes NaN
+    # for close-approach orbits.  Must happen before ANY pyoorb call below,
+    # including the fo_fit single-orbit call when valid_qualifying is empty.
+    _init_oorb(force=True)
+
     if not valid_qualifying:
         pass   # fall through to fo_fit block
     else:
@@ -889,11 +901,7 @@ def identify_tracklet(
         # 3. Per-candidate residual arrays
         all_residuals = [[np.inf] * n_obs for _ in range(n_cands)]
 
-        # 4. One pyoorb batch call per obscode group.
-        # Force pyoorb re-init: after heavy Phase 2 use the N-body integrator
-        # accumulates internal state (step-size caches) that makes it return NaN
-        # for close-approach orbits.  Re-calling oorb_init resets this state.
-        _init_oorb(force=True)
+        # 4. One pyoorb batch call per obscode group
         for obscode, obs_indices in by_obscode.items():
             epoch_tts = [t_tts[i] for i in obs_indices]
             try:
@@ -949,16 +957,26 @@ def identify_tracklet(
             from .orbitfit import refit_from_obs, _fo_available
             if _fo_available():
                 log.info('identify_tracklet: running fo orbit fit on %d observations', n_obs)
-                fo_orbit = refit_from_obs(observations, timeout_sec=fo_timeout_sec)
-                if fo_orbit is not None:
-                    # Build pyoorb orbit from fo-fitted elements
+                result = refit_from_obs(observations, timeout_sec=fo_timeout_sec)
+                if result is not None:
+                    fo_orbit, fo_quality = result
+                    # fo's own internal RMS is reliable even for close-approach objects
+                    # where pyoorb re-evaluation diverges.
+                    fo_rms_internal = fo_quality.get('rms_arcsec', np.nan)
+                    fo_n_obs_fit    = fo_quality.get('n_obs', None)
+                    fo_earth_moid   = fo_quality.get('earth_moid_au', None)
+
+                    # Build pyoorb orbit from fo-fitted elements for per-obs O-C display
                     fo_pyoorb = build_oorb_orbits_kep(
                         fo_orbit['a'], fo_orbit['e'],
                         fo_orbit['i']     * _DEG2RAD, fo_orbit['Omega'] * _DEG2RAD,
                         fo_orbit['omega'] * _DEG2RAD, fo_orbit['M']     * _DEG2RAD,
                         fo_orbit['epoch'], fo_orbit['H'], fo_orbit['G'],
                     )
-                    # Compute per-observation O-C from fo orbit
+                    # Re-init pyoorb before fo single-orbit call (may have been
+                    # corrupted by ephemeris-method batch above)
+                    _init_oorb(force=True)
+                    # Compute per-observation O-C from fo orbit via pyoorb
                     fo_residuals: List[float] = [np.inf] * n_obs
                     try:
                         for obscode, obs_indices in by_obscode.items():
@@ -968,22 +986,32 @@ def identify_tracklet(
                                 obscodes=obscodes)
                             for k, obs_i in enumerate(obs_indices):
                                 obs = observations[obs_i]
-                                sep = ang_sep_deg(
-                                    float(eph[0, k, 1]), float(eph[0, k, 2]),
-                                    obs.ra_deg, obs.dec_deg) * 3600.0
-                                fo_residuals[obs_i] = sep
+                                ra_p  = float(eph[0, k, 1])
+                                dec_p = float(eph[0, k, 2])
+                                if np.isfinite(ra_p) and np.isfinite(dec_p):
+                                    sep = ang_sep_deg(ra_p, dec_p,
+                                                      obs.ra_deg, obs.dec_deg) * 3600.0
+                                    fo_residuals[obs_i] = sep
                     except Exception as exc:
                         log.debug('identify_tracklet: fo residual computation failed: %s', exc)
 
-                    if all(r < np.inf for r in fo_residuals):
-                        fo_rms = float(np.sqrt(np.mean(np.array(fo_residuals) ** 2)))
+                    # Use fo's own RMS as the primary quality metric.
+                    # pyoorb re-evaluation can be unreliable for close-approach objects
+                    # (e.g. 119" pyoorb vs 0.4" fo-internal for a genuine new NEO).
+                    # Fall back to pyoorb RMS only if fo's value is not available.
+                    finite_resids = [r for r in fo_residuals if np.isfinite(r)]
+                    fo_rms_pyoorb = (float(np.sqrt(np.mean(np.array(finite_resids) ** 2)))
+                                     if finite_resids else np.nan)
+                    primary_rms = (fo_rms_internal
+                                   if np.isfinite(fo_rms_internal) else fo_rms_pyoorb)
+
+                    if np.isfinite(primary_rms):
                         # Anchor: prefer best ephemeris match; fall back to
                         # Phase 2 candidate; or None when fo-only (no Phase 2).
                         anchor = (identifications[0].match if identifications else
                                   (best_match[qualifying[0]] if qualifying else None))
 
-                        # Catalog match by orbital element similarity (covers the
-                        # close-approach NEO case where no Phase 2 candidate was found)
+                        # Catalog match by orbital element similarity
                         cat_name, cat_packed, cat_score = _find_catalog_match_by_elements(
                             fo_orbit, asteroids)
 
@@ -991,7 +1019,6 @@ def identify_tracklet(
                         # prefer that over element-similarity result
                         fo_desig = str(fo_orbit['desig'][0]).strip()
                         if fo_desig and fo_desig not in ('ZMPCK', ''):
-                            # fo self-identified the object; try to find it in catalog
                             idx = np.where(
                                 (asteroids['desig'] == fo_desig) |
                                 (asteroids['packed'] == fo_desig)
@@ -1001,13 +1028,13 @@ def identify_tracklet(
                                 cat_packed = str(asteroids['packed'][idx[0]]).strip()
                                 cat_score  = 0.0
                             else:
-                                # fo named something not in our catalog
                                 cat_name  = fo_desig
                                 cat_score = 0.0
 
                         log.info(
-                            'identify_tracklet: fo fit RMS=%.2f"  catalog match: %s (score=%.4f)',
-                            fo_rms,
+                            'identify_tracklet: fo fit RMS=%.2f" (fo-internal)'
+                            '  catalog match: %s (score=%.4f)',
+                            primary_rms,
                             cat_name or 'none',
                             cat_score if cat_score is not None else float('nan'),
                         )
@@ -1015,12 +1042,15 @@ def identify_tracklet(
                         identifications.append(Identification(
                             match=anchor,
                             residuals=list(fo_residuals),
-                            rms_arcsec=fo_rms,
+                            rms_arcsec=primary_rms,
                             n_obs=n_obs,
                             method='orbit_fit',
                             fo_elements=fo_orbit,
                             fo_catalog_name=cat_name,
                             fo_catalog_score=cat_score,
+                            fo_rms_internal=fo_rms_internal,
+                            fo_n_obs=fo_n_obs_fit,
+                            fo_earth_moid_au=fo_earth_moid,
                         ))
         except Exception as exc:
             log.debug('identify_tracklet: fo fit failed: %s', exc)

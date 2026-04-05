@@ -23,6 +23,9 @@ Usage examples:
   # Check a single RA/Dec/epoch/obscode (no input file)
   mpchecker --ra 123.456 --dec -12.345 --epoch 2024-03-15 --obscode 568
 
+  # Machine-readable JSON output
+  mpchecker obs.txt --json
+
   # Download / update orbit data before running
   mpchecker --download-data
   mpchecker --download-data --satellites-only
@@ -36,9 +39,12 @@ Usage examples:
 
 import argparse
 import glob
+import json as _json_mod
 import logging
 import sys
 from pathlib import Path
+
+import numpy as np
 
 from .config import DATA_DIR, ORBS_DIR, CACHE_DIR
 
@@ -64,6 +70,32 @@ def _dec_to_dms(dec_deg: float) -> str:
     return f'{sign}{d:02d} {m:02d} {s:05.2f}'
 
 
+def _ident_display_name(ident) -> str:
+    """Return the best human-readable name for an Identification."""
+    m = ident.match
+    if m is not None:
+        return m.name
+    if ident.fo_catalog_name:
+        return ident.fo_catalog_name
+    return 'unknown'
+
+
+def _ident_status(ident, obs_list) -> str:
+    """Classify an Identification for summary display."""
+    if ident.method == 'ephemeris':
+        return 'IDENTIFIED'
+    # orbit_fit method
+    if ident.fo_catalog_name or (ident.match is not None):
+        return 'IDENTIFIED'
+    # No catalog match — evaluate if likely a real new object
+    n_nights = len(set(int(o.epoch_mjd) for o in obs_list))
+    n_fit = ident.fo_n_obs or 0
+    rms = ident.rms_arcsec
+    if n_fit >= 4 and n_nights >= 2 and np.isfinite(rms) and rms < 5.0:
+        return 'CANDIDATE_NEW'
+    return 'UNRESOLVED'
+
+
 def format_identifications(identifications, observations,
                            designation: str = '') -> str:
     """
@@ -81,6 +113,7 @@ def format_identifications(identifications, observations,
     lines = [f'\n{"="*60}',
              f'Tracklet identification{label} ({len(observations)} obs):',
              f'{"="*60}']
+    fo_rms_note = False
     for rank, ident in enumerate(identifications, 1):
         m = ident.match
         method_label = {
@@ -88,49 +121,266 @@ def format_identifications(identifications, observations,
             'orbit_fit':  'fo orbit fit',
         }.get(ident.method, ident.method)
 
-        # Name: use match.name when available; for orbit_fit-only fall back to
-        # catalog element-similarity hit or "unknown"
-        if m is not None:
-            display_name = m.name
-        elif ident.fo_catalog_name:
-            display_name = ident.fo_catalog_name
+        display_name = _ident_display_name(ident)
+
+        # For orbit_fit: rms_arcsec is fo's own internal RMS (reliable).
+        # Flag with † to distinguish from pyoorb O-C residuals.
+        if ident.method == 'orbit_fit' and ident.fo_rms_internal is not None:
+            rms_str = f'{ident.rms_arcsec:.2f}"†'
+            fo_rms_note = True
         else:
-            display_name = 'unknown'
+            rms_str = f'{ident.rms_arcsec:.2f}"'
 
         lines.append(
             f'\n [{rank}] {display_name}  [{method_label}]'
-            f'  RMS = {ident.rms_arcsec:.2f}"'
+            f'  RMS = {rms_str}'
         )
         # Show individual residuals (truncate if very many observations)
         resids = ident.residuals
-        if len(resids) <= 12:
-            resid_str = '  '.join(f'{r:.2f}"' for r in resids)
-        else:
-            first6 = '  '.join(f'{r:.2f}"' for r in resids[:6])
-            last2  = '  '.join(f'{r:.2f}"' for r in resids[-2:])
-            resid_str = f'{first6}  …  {last2}  (n={len(resids)})'
-        lines.append(f'     O-C per obs: {resid_str}')
+        finite_resids = [r for r in resids if np.isfinite(r)]
+        if finite_resids:
+            if len(resids) <= 12:
+                resid_str = '  '.join(
+                    f'{r:.2f}"' if np.isfinite(r) else '  —  ' for r in resids)
+            else:
+                first6 = '  '.join(
+                    f'{r:.2f}"' if np.isfinite(r) else '—' for r in resids[:6])
+                last2 = '  '.join(
+                    f'{r:.2f}"' if np.isfinite(r) else '—' for r in resids[-2:])
+                resid_str = f'{first6}  …  {last2}  (n={len(resids)})'
+            lines.append(f'     O-C per obs (pyoorb): {resid_str}')
         if ident.method == 'ephemeris' and m is not None:
+            uq = f'  U={m.orbit_quality}' if m.orbit_quality else ''
             lines.append(
                 f'     Catalog: V={m.vmag:.1f}  sep={m.sep_arcsec:.1f}"  '
                 f'r={m.r_helio:.3f} AU  Δ={m.delta:.3f} AU  phase={m.phase_deg:.1f}°'
+                f'{uq}'
             )
         if ident.method == 'orbit_fit' and ident.fo_elements is not None:
             el = ident.fo_elements
+            moid_str = (f'  Earth MOID={ident.fo_earth_moid_au:.4f} AU'
+                        if ident.fo_earth_moid_au is not None
+                           and np.isfinite(ident.fo_earth_moid_au) else '')
             lines.append(
                 f'     fo elements: a={float(el["a"][0]):.4f} AU  '
                 f'e={float(el["e"][0]):.4f}  '
                 f'i={float(el["i"][0]):.2f}°  '
                 f'epoch MJD {float(el["epoch"][0]):.1f}'
+                f'{moid_str}'
             )
             if ident.fo_catalog_name and ident.fo_catalog_score is not None:
-                score_str = f'{ident.fo_catalog_score:.4f}'
                 lines.append(
                     f'     Catalog match (Δ-elements): {ident.fo_catalog_name}'
-                    f'  (score={score_str})'
+                    f'  (score={ident.fo_catalog_score:.4f})'
                 )
+    if fo_rms_note:
+        lines.append('     † fo internal residual (reliable for close-approach objects)')
     lines.append('')
     return '\n'.join(lines)
+
+
+def format_identification_summary(
+    all_idents_by_desig: dict,
+    obs_by_desig: dict,
+) -> str:
+    """
+    One-line-per-cluster summary table for batch --identify runs.
+
+    Parameters
+    ----------
+    all_idents_by_desig : dict mapping designation → list[Identification]
+    obs_by_desig        : dict mapping designation → list[Observation]
+    """
+    if not all_idents_by_desig and not obs_by_desig:
+        return ''
+
+    n_total = len(obs_by_desig)
+    lines = [
+        f'\n{"="*70}',
+        f'Identification Summary ({n_total} cluster{"s" if n_total != 1 else ""}):',
+        f'{"="*70}',
+        f'  {"Cluster":<12} {"Obs":>4}  {"Matched":<28} {"Method":<10} {"RMS":>8}',
+        f'  {"-"*12} {"-"*4}  {"-"*28} {"-"*10} {"-"*8}',
+    ]
+    fo_rms_any = False
+    for desig in sorted(obs_by_desig.keys()):
+        obs_list  = obs_by_desig[desig]
+        n_obs_d   = len(obs_list)
+        idents    = all_idents_by_desig.get(desig, [])
+
+        if not idents:
+            lines.append(f'  {desig:<12} {n_obs_d:>4}  {"—":<28} {"—":<10} {"—":>8}')
+            continue
+
+        best = idents[0]
+        status = _ident_status(best, obs_list)
+        name   = _ident_display_name(best)
+
+        if status == 'CANDIDATE_NEW':
+            el = best.fo_elements
+            if el is not None:
+                a_str = f'a={float(el["a"][0]):.3f}'
+                name  = f'CANDIDATE NEW ({a_str})'
+            else:
+                name = 'CANDIDATE NEW'
+        elif status == 'UNRESOLVED':
+            name = 'UNRESOLVED'
+
+        method_str = {
+            'ephemeris': 'ephemeris',
+            'orbit_fit': 'fo_fit',
+        }.get(best.method, best.method)
+
+        if best.method == 'orbit_fit' and best.fo_rms_internal is not None:
+            rms_str = f'{best.rms_arcsec:.1f}"†'
+            fo_rms_any = True
+        else:
+            rms_str = f'{best.rms_arcsec:.1f}"'
+
+        lines.append(
+            f'  {desig:<12} {n_obs_d:>4}  {name:<28} {method_str:<10} {rms_str:>8}'
+        )
+
+    if fo_rms_any:
+        lines.append('  † fo internal residual (not pyoorb re-evaluation)')
+    lines.append(f'{"="*70}')
+    return '\n'.join(lines)
+
+
+def format_results_json(
+    results,
+    search_radius_arcmin: float,
+    identifications_by_desig: dict = None,
+    obs_by_desig: dict = None,
+) -> dict:
+    """
+    Produce a JSON-serialisable dict of all results.
+
+    Suitable for machine-readable output via --json.  Structure:
+      meta          — run metadata and summary counts
+      observations  — list of per-observation dicts, each with a 'matches' list
+      identifications — per-cluster identification results (when --identify used)
+    """
+    import time as _time
+
+    n_obs          = len(results)
+    n_with_matches = sum(1 for r in results if r.matches)
+    epoch_mjds     = [r.obs.epoch_mjd for r in results]
+    median_epoch   = float(np.median(epoch_mjds)) if epoch_mjds else None
+
+    out: dict = {
+        'meta': {
+            'generated_mjd':      median_epoch,
+            'search_radius_arcmin': search_radius_arcmin,
+            'n_observations':      n_obs,
+            'n_with_matches':      n_with_matches,
+        },
+        'observations': [],
+    }
+
+    for res in results:
+        obs = res.obs
+        obs_dict = {
+            'designation': obs.designation or '',
+            'epoch_mjd':   round(obs.epoch_mjd, 6),
+            'ra_deg':      round(obs.ra_deg, 6),
+            'dec_deg':     round(obs.dec_deg, 6),
+            'obscode':     obs.obscode,
+            'matches': [],
+        }
+        if obs.mag is not None:
+            obs_dict['obs_mag']  = round(float(obs.mag), 2)
+            obs_dict['obs_band'] = obs.band or ''
+        for m in res.matches:
+            mdict = {
+                'name':               m.name,
+                'packed':             m.packed,
+                'obj_type':           m.obj_type,
+                'sep_arcsec':         round(m.sep_arcsec, 2),
+                'ra_deg':             round(m.ra_deg, 6),
+                'dec_deg':            round(m.dec_deg, 6),
+                'ra_rate_arcsec_hr':  round(m.ra_rate, 3),
+                'dec_rate_arcsec_hr': round(m.dec_rate, 3),
+                'r_au':               round(m.r_helio, 5),
+                'delta_au':           round(m.delta, 5),
+                'vmag':               round(m.vmag, 2),
+                'phase_deg':          round(m.phase_deg, 2),
+            }
+            if m.orbit_quality:
+                mdict['orbit_quality'] = m.orbit_quality
+            obs_dict['matches'].append(mdict)
+        out['observations'].append(obs_dict)
+
+    # Identifications section
+    if identifications_by_desig:
+        idents_list = []
+        for desig, idents in identifications_by_desig.items():
+            if not idents:
+                continue
+            grp_obs = (obs_by_desig or {}).get(desig, [])
+            for ident in idents:
+                status = _ident_status(ident, grp_obs)
+                idict: dict = {
+                    'designation': desig,
+                    'n_obs':       ident.n_obs,
+                    'method':      ident.method,
+                    'status':      status,
+                    'rms_arcsec':  round(ident.rms_arcsec, 3)
+                                   if np.isfinite(ident.rms_arcsec) else None,
+                }
+                # Match name
+                name = _ident_display_name(ident)
+                idict['match_name'] = name if name != 'unknown' else None
+
+                if ident.method == 'ephemeris':
+                    # Per-obs residuals
+                    idict['residuals_arcsec'] = [
+                        round(r, 2) if np.isfinite(r) else None
+                        for r in ident.residuals]
+                    if ident.match:
+                        idict['catalog_sep_arcsec'] = round(ident.match.sep_arcsec, 2)
+                        idict['vmag']               = round(ident.match.vmag, 2)
+                        idict['delta_au']           = round(ident.match.delta, 5)
+                        if ident.match.orbit_quality:
+                            idict['orbit_quality']  = ident.match.orbit_quality
+
+                if ident.method == 'orbit_fit':
+                    if ident.fo_rms_internal is not None and np.isfinite(ident.fo_rms_internal):
+                        idict['fo_rms_arcsec'] = round(ident.fo_rms_internal, 3)
+                    if ident.fo_n_obs is not None:
+                        idict['fo_n_obs']      = ident.fo_n_obs
+                    if (ident.fo_earth_moid_au is not None
+                            and np.isfinite(ident.fo_earth_moid_au)):
+                        idict['fo_earth_moid_au'] = round(ident.fo_earth_moid_au, 5)
+                    if ident.fo_catalog_name:
+                        idict['catalog_match']       = ident.fo_catalog_name
+                        idict['catalog_match_score'] = (
+                            round(ident.fo_catalog_score, 5)
+                            if ident.fo_catalog_score is not None else None)
+                    if ident.fo_elements is not None:
+                        el = ident.fo_elements
+                        idict['fo_elements'] = {
+                            'a':        round(float(el['a'][0]),     6),
+                            'e':        round(float(el['e'][0]),     6),
+                            'i':        round(float(el['i'][0]),     4),
+                            'Omega':    round(float(el['Omega'][0]), 4),
+                            'omega':    round(float(el['omega'][0]), 4),
+                            'M':        round(float(el['M'][0]),     4),
+                            'epoch_mjd': round(float(el['epoch'][0]), 2),
+                            'H':        round(float(el['H'][0]),     2),
+                        }
+                    # pyoorb re-evaluation residuals (may be unreliable for close-approach)
+                    finite_resids = [r for r in ident.residuals if np.isfinite(r)]
+                    if finite_resids:
+                        idict['pyoorb_residuals_arcsec'] = [
+                            round(r, 2) if np.isfinite(r) else None
+                            for r in ident.residuals]
+
+                idents_list.append(idict)
+
+        out['identifications'] = idents_list
+
+    return out
 
 
 def format_results(results, search_radius_arcmin: float) -> str:
@@ -151,18 +401,19 @@ def format_results(results, search_radius_arcmin: float) -> str:
                          f'{search_radius_arcmin:.0f} arcmin.')
             continue
 
-        # Header row
+        # Header row — U column shows MPC orbit quality code
         lines.append(
-            f'  {"Name":<30} {"Type":<12} '
+            f'  {"Name":<30} {"U":1}  {"Type":<12} '
             f'{"RA":>15} {"Dec":>15} '
             f'{"Sep":>8} {"dRA":>8} {"dDec":>8} '
             f'{"r(AU)":>7} {"Δ(AU)":>7} {"V":>5} {"Ph°":>5}'
         )
-        lines.append('  ' + '-'*120)
+        lines.append('  ' + '-'*125)
 
         for m in res.matches:
+            uq = m.orbit_quality if m.orbit_quality else '-'
             lines.append(
-                f'  {m.name:<30} {m.obj_type:<12} '
+                f'  {m.name:<30} {uq:1}  {m.obj_type:<12} '
                 f'{_ra_to_hms(m.ra_deg):>15} {_dec_to_dms(m.dec_deg):>15} '
                 f'{m.sep_arcsec:>7.1f}" '
                 f'{m.ra_rate:>+8.2f} {m.dec_rate:>+8.2f} '
@@ -348,6 +599,10 @@ def main(argv=None):
     parser.add_argument('--dedup', action='store_true',
                         help='Only check the first observation per object designation '
                              '(useful when a file contains many epochs of the same object)')
+    parser.add_argument('--json', action='store_true',
+                        help='Output results as JSON (machine-readable) instead of text table. '
+                             'When combined with --identify the JSON includes per-cluster '
+                             'identification results and orbital elements.')
     parser.add_argument('--output', '-o', type=Path,
                         help='Write results to file instead of stdout')
     parser.add_argument('--verbose', '-v', action='store_true',
@@ -635,6 +890,9 @@ def main(argv=None):
 
     # Optional: tracklet identification (O-C residuals across all observations)
     identification_output = ''
+    idents_by_desig:    dict = {}   # designation → list[Identification] (for JSON / summary)
+    obs_grp_by_desig:   dict = {}   # designation → list[Observation]
+
     if args.identify:
         from .checker import identify_tracklet
         from collections import defaultdict as _dd
@@ -648,6 +906,7 @@ def main(argv=None):
         id_parts = []
         if len(unique_desigs) <= 1:
             # Single tracklet — original behaviour
+            desig0 = unique_desigs[0] if unique_desigs else ''
             idents = identify_tracklet(
                 observations, results,
                 asteroids, comets, obscodes,
@@ -657,9 +916,11 @@ def main(argv=None):
                 fo_fit=args.fo_fit,
                 fo_timeout_sec=60,
             )
+            idents_by_desig[desig0]  = idents
+            obs_grp_by_desig[desig0] = observations
             if idents:
                 id_parts.append(format_identifications(
-                    idents, observations, designation=unique_desigs[0]))
+                    idents, observations, designation=desig0))
             else:
                 id_parts.append(
                     f'\n{"="*60}\n'
@@ -669,7 +930,6 @@ def main(argv=None):
                 )
         else:
             # Multi-cluster file: run identify_tracklet per designation group.
-            # Build index maps once.
             idx_by_desig: dict = _dd(list)
             for i, key in enumerate(desig_keys):
                 idx_by_desig[key].append(i)
@@ -677,9 +937,11 @@ def main(argv=None):
             n_identified = 0
             for desig in unique_desigs:
                 grp_indices = idx_by_desig[desig]
-                if len(grp_indices) < 2:
-                    continue   # single observation — can't fit an orbit
                 grp_obs     = [observations[i] for i in grp_indices]
+                obs_grp_by_desig[desig] = grp_obs
+                if len(grp_indices) < 2:
+                    idents_by_desig[desig] = []
+                    continue   # single observation — can't fit an orbit
                 grp_results = [results[i] for i in grp_indices]
 
                 idents = identify_tracklet(
@@ -691,38 +953,45 @@ def main(argv=None):
                     fo_fit=args.fo_fit,
                     fo_timeout_sec=60,
                 )
+                idents_by_desig[desig] = idents
                 if idents:
                     n_identified += 1
                     id_parts.append(format_identifications(
                         idents, grp_obs, designation=desig))
-                # (silently skip unidentified clusters to keep output clean)
+                # (silently skip unidentified clusters in per-cluster block)
 
-            if not id_parts:
-                id_parts.append(
-                    f'\n{"="*60}\n'
-                    f'Tracklet identification: none of the {len(unique_desigs)} '
-                    f'clusters matched with O-C ≤ {args.id_threshold:.1f}" '
-                    f'in all observations.\n'
-                )
-            else:
+            # Summary table always shown for multi-cluster runs
+            summary_str = format_identification_summary(
+                idents_by_desig, obs_grp_by_desig)
+            if id_parts:
                 id_parts.insert(0,
                     f'\nIdentified {n_identified}/{len(unique_desigs)} clusters:\n')
+            id_parts.append(summary_str)
 
         identification_output = ''.join(id_parts)
 
     # Format and output
-    output = format_results(results, args.radius)
     total_matches = sum(len(r.matches) for r in results)
+
+    if args.json:
+        json_dict = format_results_json(
+            results, args.radius,
+            identifications_by_desig=idents_by_desig if args.identify else None,
+            obs_by_desig=obs_grp_by_desig if args.identify else None,
+        )
+        output = _json_mod.dumps(json_dict, indent=2)
+    else:
+        output = format_results(results, args.radius)
 
     if args.output:
         with open(args.output, 'w') as f:
             f.write(output + '\n')
-            if identification_output:
+            if not args.json and identification_output:
                 f.write(identification_output + '\n')
         print(f'Results written to {args.output}', file=sys.stderr)
     else:
         print(output)
-        if identification_output:
+        if not args.json and identification_output:
             print(identification_output)
 
     if total_matches == 0 and len(asteroids) > 0:
