@@ -25,7 +25,8 @@ from .obs_parser import Observation
 from .propagator import (
     kep_to_radec, ang_sep_deg, get_observer_helio, get_planet_helio,
     build_oorb_orbits_kep, build_oorb_orbits_com,
-    oorb_ephemeris_multi_epoch, reepoch_high_e_asteroids,
+    oorb_ephemeris_multi_epoch, oorb_ephemeris_multi_epoch_split,
+    reepoch_high_e_asteroids,
     _init_oorb,
     _DEG2RAD, _RAD2DEG,
 )
@@ -40,6 +41,23 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _PHASE1_STATE: dict = {}
 _PHASE2_STATE: dict = {}
+
+# ---------------------------------------------------------------------------
+# Phase 1 field candidate cache (P1-C)
+# Caches Phase 1 (Keplerian pre-filter) results by coarse (ra, dec, epoch, h_cut)
+# bins.  Within a 6-hour / 0.5° bin, MBA motion is < 0.18° — well below the
+# 0.5° margin used in the bin.  NEO safety: the wide-NEO and close-approach
+# passes always run on the CACHED candidates (cheap, < 1 ms), so no NEO is lost.
+#
+# Effective primarily in the daemon (single long-lived process) and for surveys
+# that revisit the same field multiple times per night (ATLAS, ZTF, etc.).
+# In fork-based multi-worker mode the cache is per-process (copy-on-write);
+# parent pre-populates on unique bins before forking.
+#
+# Max 512 entries; simple FIFO eviction to cap memory.
+# ---------------------------------------------------------------------------
+_FIELD_CACHE: dict = {}
+_FIELD_CACHE_MAX = 512
 
 
 @dataclass
@@ -130,6 +148,18 @@ def _utc_to_tt_mjd_vec(mjd_utc_iterable) -> np.ndarray:
 
 def _rate_to_arcsec_per_hr(deg_per_day: float) -> float:
     return deg_per_day * 3600.0 / 24.0
+
+
+# Obliquity of the ecliptic at J2000.0 (radians)
+_ECLIPTIC_OBL = 23.4392794 * _DEG2RAD
+
+
+def _ecliptic_lat_rad(ra_deg: float, dec_deg: float) -> float:
+    """Ecliptic latitude (radians) for J2000 equatorial (ra, dec) in degrees."""
+    ra = ra_deg * _DEG2RAD
+    dec = dec_deg * _DEG2RAD
+    sin_beta = np.sin(dec) * np.cos(_ECLIPTIC_OBL) - np.cos(dec) * np.sin(_ECLIPTIC_OBL) * np.sin(ra)
+    return float(np.arcsin(np.clip(sin_beta, -1.0, 1.0)))
 
 
 # ---------------------------------------------------------------------------
@@ -254,19 +284,23 @@ class AsteroidSOA:
     M_rad:     np.ndarray   # mean anomaly (radians)
     epoch:     np.ndarray   # epoch MJD TT
     H:         np.ndarray   # absolute magnitude
+    q:         np.ndarray   # perihelion distance (AU) = a*(1-e)
 
 
 def build_asteroid_soa(asteroids: np.ndarray) -> AsteroidSOA:
     """Build pre-extracted contiguous float64 arrays from the structured asteroid catalog."""
+    a = np.ascontiguousarray(asteroids['a'], dtype=np.float64)
+    e = np.ascontiguousarray(asteroids['e'], dtype=np.float64)
     return AsteroidSOA(
-        a=np.ascontiguousarray(asteroids['a'],     dtype=np.float64),
-        e=np.ascontiguousarray(asteroids['e'],     dtype=np.float64),
+        a=a,
+        e=e,
         i_rad=np.ascontiguousarray(asteroids['i'],     dtype=np.float64) * _DEG2RAD,
         Omega_rad=np.ascontiguousarray(asteroids['Omega'], dtype=np.float64) * _DEG2RAD,
         omega_rad=np.ascontiguousarray(asteroids['omega'], dtype=np.float64) * _DEG2RAD,
         M_rad=np.ascontiguousarray(asteroids['M'],     dtype=np.float64) * _DEG2RAD,
         epoch=np.ascontiguousarray(asteroids['epoch'], dtype=np.float64),
         H=np.ascontiguousarray(asteroids['H'],     dtype=np.float64),
+        q=a * (1.0 - e),
     )
 
 
@@ -357,33 +391,69 @@ def _phase1_one_obs(
     ast_cands     = np.array([], dtype=np.intp)
     _INDEX_THRESHOLD = 400_000
 
-    if (sky_index is not None and sky_index.is_fresh(obs.epoch_mjd)
-            and n_h_filtered > _INDEX_THRESHOLD):
-        idx_mask = sky_index.candidates(obs.ra_deg, obs.dec_deg, prefilter_deg,
-                                        t_obs_mjd=obs.epoch_mjd)
-        idx_mask &= (_H_arr <= h_cut)
-        broad_idx = np.where(idx_mask)[0]
-        log.debug('Index cone: %d candidates for %s', len(broad_idx), obs.designation)
-        if len(broad_idx) > 0:
-            kep_mask  = _asteroid_prefilter(
-                asteroids[broad_idx], obs_helio, t_tt,
-                obs.ra_deg, obs.dec_deg, prefilter_deg)
-            ast_cands = broad_idx[kep_mask]
+    # Field candidate cache (P1-C): cache the main-scan result by coarse spatial
+    # / temporal / magnitude bin.  Within a 0.5°/6-hr/0.5-mag bin, MBA motion
+    # < 0.18° — well inside the bin margin.  The NEO safety passes below always
+    # run regardless of cache state.
+    _cache_key = (round(obs.ra_deg / 0.5) * 0.5,
+                  round(obs.dec_deg / 0.5) * 0.5,
+                  int(obs.epoch_mjd / 0.25),
+                  round(h_cut / 0.5) * 0.5)
+    if _cache_key in _FIELD_CACHE:
+        ast_cands = _FIELD_CACHE[_cache_key].copy()
+        log.debug('Field cache hit for %s (%d cands)', obs.designation, len(ast_cands))
     else:
-        h_mask = _H_arr <= h_cut
-        log.debug('H≤%.1f cut: %d/%d asteroids for %s',
-                  h_cut, n_h_filtered, len(asteroids), obs.designation)
-        if n_h_filtered > 0:
-            if asteroid_soa is not None:
-                kep_mask = _asteroid_prefilter_soa(
-                    asteroid_soa, h_mask, obs_helio, t_tt,
+        if (sky_index is not None and sky_index.is_fresh(obs.epoch_mjd)
+                and n_h_filtered > _INDEX_THRESHOLD):
+            idx_mask = sky_index.candidates(obs.ra_deg, obs.dec_deg, prefilter_deg,
+                                            t_obs_mjd=obs.epoch_mjd)
+            idx_mask &= (_H_arr <= h_cut)
+            broad_idx = np.where(idx_mask)[0]
+            log.debug('Index cone: %d candidates for %s', len(broad_idx), obs.designation)
+            if len(broad_idx) > 0:
+                kep_mask  = _asteroid_prefilter(
+                    asteroids[broad_idx], obs_helio, t_tt,
                     obs.ra_deg, obs.dec_deg, prefilter_deg)
-            else:
-                kep_mask = _asteroid_prefilter(
-                    asteroids[h_mask], obs_helio, t_tt,
-                    obs.ra_deg, obs.dec_deg, prefilter_deg)
-            bright_global_idx = np.where(h_mask)[0]
-            ast_cands         = bright_global_idx[kep_mask]
+                ast_cands = broad_idx[kep_mask]
+        else:
+            h_mask = _H_arr <= h_cut
+            # Element-space pre-filter: narrow h_mask before the Keplerian kernel.
+            # (1) Inclination lower bound — objects with i < |ecliptic_lat| - buffer
+            #     can never reach the observation's ecliptic latitude.  Safe: never
+            #     produces false negatives.  Most effective for high-latitude fields.
+            # (2) Perihelion brightness limit — objects whose brightness at closest
+            #     approach (perihelion, opposition geometry) still exceeds mag_limit
+            #     are never visible.  Handles faint outer-belt objects that slip past
+            #     the H cut (which assumes a fixed r≈2.5 AU).
+            # Both filters are only applied when the SOA is available (pre-extracted
+            # arrays avoid the strided-access cost of the structured array).
+            if asteroid_soa is not None and n_h_filtered > 0:
+                r_obs_dist = float(np.linalg.norm(obs_helio))
+                # (1) inclination lower bound
+                ecl_lat = _ecliptic_lat_rad(obs.ra_deg, obs.dec_deg)
+                i_min   = max(0.0, abs(ecl_lat) - 0.17)   # 0.17 rad ≈ 10° safety buffer
+                h_mask &= asteroid_soa.i_rad >= i_min
+                # (2) perihelion brightness: q*(q - r_obs) <= 10^((mag_limit-H)/5)
+                q_arr   = asteroid_soa.q
+                q_delta = np.maximum(q_arr - r_obs_dist, 0.001)
+                h_mask &= q_arr * q_delta <= np.power(10.0, (mag_limit - asteroid_soa.H) / 5.0)
+            log.debug('H≤%.1f + element filter: %d/%d asteroids for %s',
+                      h_cut, int(h_mask.sum()), len(asteroids), obs.designation)
+            if h_mask.any():
+                if asteroid_soa is not None:
+                    kep_mask = _asteroid_prefilter_soa(
+                        asteroid_soa, h_mask, obs_helio, t_tt,
+                        obs.ra_deg, obs.dec_deg, prefilter_deg)
+                else:
+                    kep_mask = _asteroid_prefilter(
+                        asteroids[h_mask], obs_helio, t_tt,
+                        obs.ra_deg, obs.dec_deg, prefilter_deg)
+                bright_global_idx = np.where(h_mask)[0]
+                ast_cands         = bright_global_idx[kep_mask]
+        # Store main-scan result to cache (NEO passes run separately below)
+        if len(_FIELD_CACHE) >= _FIELD_CACHE_MAX:
+            _FIELD_CACHE.pop(next(iter(_FIELD_CACHE)))  # FIFO eviction
+        _FIELD_CACHE[_cache_key] = ast_cands.copy()
 
     # Wide second pass for high-eccentricity objects (close-approach NEOs).
     # Keplerian propagation accumulates O(20') errors for NEOs at closest approach
@@ -549,8 +619,10 @@ def _phase2_worker(group_item):
             sub['epoch'], sub['H'], sub['G'],
         )
         t_tts = [obs_meta[i]['t_tt'] for i in obs_indices]
-        eph_batch = oorb_ephemeris_multi_epoch(
-            orbits, t_tts, obscode, dynmodel, obscodes=obscodes)
+        eph_batch = oorb_ephemeris_multi_epoch_split(
+            orbits, t_tts, obscode,
+            a_arr=sub['a'], e_arr=sub['e'],
+            dynmodel_nea=dynmodel, obscodes=obscodes)
 
         for k, obs_i in enumerate(obs_indices):
             my_cands = obs_meta[obs_i]['ast_cands']
@@ -838,8 +910,10 @@ def check_observations(
                     sub['epoch'], sub['H'], sub['G'],
                 )
                 t_tts = [obs_meta[i]['t_tt'] for i in obs_indices]
-                eph_batch = oorb_ephemeris_multi_epoch(orbits, t_tts, obscode, dynmodel,
-                                                       obscodes=obscodes)
+                eph_batch = oorb_ephemeris_multi_epoch_split(
+                    orbits, t_tts, obscode,
+                    a_arr=sub['a'], e_arr=sub['e'],
+                    dynmodel_nea=dynmodel, obscodes=obscodes)
 
                 for k, obs_i in enumerate(obs_indices):
                     my_cands = obs_meta[obs_i]['ast_cands']

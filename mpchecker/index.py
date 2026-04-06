@@ -325,6 +325,19 @@ class MultiSkyIndex:
             return False
         return min(abs(s.t_ref_mjd - t_mjd) for s in self._snaps) <= self._half_interval
 
+    def covers(self, t_min: float, t_max: float) -> bool:
+        """True if the index covers the entire range [t_min, t_max].
+
+        Requires that every point in [t_min, t_max] is within half_interval of
+        at least one snapshot — i.e. the first snapshot covers t_min and the
+        last covers t_max.
+        """
+        if not self._snaps:
+            return False
+        t_first = self._snaps[0].t_ref_mjd - self._half_interval
+        t_last  = self._snaps[-1].t_ref_mjd + self._half_interval
+        return t_min >= t_first and t_max <= t_last
+
     def candidates(
         self,
         ra_deg:        float,
@@ -355,6 +368,8 @@ def get_or_build_index(
     obscodes:          dict,
     cache_dir:         Path,
     t_now_mjd:         Optional[float] = None,
+    t_min_mjd:         Optional[float] = None,
+    t_max_mjd:         Optional[float] = None,
     n_snapshots:       int   = _N_SNAPSHOTS,
     snapshot_interval: float = _SNAPSHOT_INTERVAL_DAYS,
     validity_days:     float = _DEFAULT_VALIDITY_DAYS,
@@ -364,9 +379,13 @@ def get_or_build_index(
     """
     Load a fresh multi-snapshot index from cache_dir, or build and save a new one.
 
-    Four snapshots are built at ±1 and ±3 days around t_now_mjd (for
-    n_snapshots=4, interval=2).  Any query within ±4 days of t_now_mjd is
-    served by a snapshot at most 1 day away, keeping the motion buffer tight.
+    When t_min_mjd and t_max_mjd are provided (recommended for batch processing),
+    the index is extended to cover the full epoch range: n_snapshots is derived
+    from the span and t_now_mjd is set to the midpoint.  This eliminates the
+    full-catalog Keplerian scan for historical or future batch files.
+
+    Without t_min/t_max: four snapshots at ±1 and ±3 days around t_now_mjd
+    (n_snapshots=4, interval=2) cover ±4 days.
 
     Old index files are cleaned up automatically when a rebuild is needed.
 
@@ -375,14 +394,24 @@ def get_or_build_index(
     asteroids         : full asteroid catalog (structured array)
     obscodes          : observatory code dict
     cache_dir         : directory to store snapshot files
-    t_now_mjd         : center epoch (MJD UTC). Defaults to now.
-    n_snapshots       : number of snapshots to build (default 4)
+    t_now_mjd         : center epoch (MJD UTC). Defaults to midpoint of
+                        [t_min_mjd, t_max_mjd] if provided, else now.
+    t_min_mjd         : earliest observation epoch in the batch (MJD UTC)
+    t_max_mjd         : latest observation epoch in the batch (MJD UTC)
+    n_snapshots       : number of snapshots (overridden when t_min/t_max given)
     snapshot_interval : days between consecutive snapshots (default 2)
-    validity_days     : validity stored in each individual SkyIndex (for legacy
-                        single-index is_fresh checks)
+    validity_days     : validity stored in each individual SkyIndex
     force_rebuild     : always rebuild, ignoring any cached files
     """
     from astropy.time import Time
+
+    # Derive span-aware parameters when batch epoch range is provided
+    if t_min_mjd is not None and t_max_mjd is not None:
+        span = t_max_mjd - t_min_mjd
+        n_snapshots = max(_N_SNAPSHOTS, int(np.ceil(span / snapshot_interval)) + 2)
+        if t_now_mjd is None:
+            t_now_mjd = (t_min_mjd + t_max_mjd) / 2.0
+        log.info('Batch epoch range %.1f days → %d snapshots', span, n_snapshots)
 
     if t_now_mjd is None:
         t_now_mjd = Time.now().mjd
@@ -403,12 +432,17 @@ def get_or_build_index(
 
         if snaps:
             multi = MultiSkyIndex(snaps, snapshot_interval)
-            if multi.is_fresh(t_now_mjd):
+            # Use covers() when a batch range is known, is_fresh() otherwise
+            if t_min_mjd is not None and t_max_mjd is not None:
+                cache_ok = multi.covers(t_min_mjd, t_max_mjd)
+            else:
+                cache_ok = multi.is_fresh(t_now_mjd)
+            if cache_ok:
                 log.info('Using %d cached index snapshot(s) (nearest %.1f days away)',
                          len(snaps),
                          min(abs(s.t_ref_mjd - t_now_mjd) for s in snaps))
                 return multi
-            log.info('Cached index stale for MJD=%.1f, rebuilding …', t_now_mjd)
+            log.info('Cached index does not cover required range, rebuilding …')
 
         # Remove stale files before rebuild
         for npz in cache_dir.glob('sky_index_*.npz'):

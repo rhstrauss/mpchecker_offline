@@ -188,6 +188,21 @@ def _handle_client(conn, asteroids, comets, obscodes, sky_index, n_workers,
     data = _recv_msg(conn)
     observations, params = pickle.loads(data)
 
+    # If the request's epoch range extends beyond the current index, rebuild it.
+    if observations:
+        epochs = [o.epoch_mjd for o in observations]
+        t_min, t_max = min(epochs), max(epochs)
+        if not sky_index.covers(t_min, t_max):
+            log.info('Index does not cover batch range %.1f–%.1f, rebuilding …', t_min, t_max)
+            from .index import get_or_build_index
+            from .config import CACHE_DIR
+            try:
+                sky_index = get_or_build_index(
+                    asteroids, obscodes, CACHE_DIR,
+                    t_min_mjd=t_min, t_max_mjd=t_max)
+            except Exception as exc:
+                log.error('Index rebuild failed: %s', exc)
+
     from .checker import check_observations
     results = check_observations(
         observations, asteroids, comets, obscodes,

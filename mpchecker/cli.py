@@ -1006,9 +1006,12 @@ def main(argv=None):
         try:
             from .index import get_or_build_index
             from .config import CACHE_DIR
-            t_rep = observations[0].epoch_mjd if observations else None
+            epochs = [o.epoch_mjd for o in observations] if observations else []
+            t_min = min(epochs) if epochs else None
+            t_max = max(epochs) if epochs else None
             sky_index = get_or_build_index(
-                asteroids, obscodes, CACHE_DIR, t_now_mjd=t_rep)
+                asteroids, obscodes, CACHE_DIR,
+                t_min_mjd=t_min, t_max_mjd=t_max)
         except Exception as exc:
             logging.getLogger(__name__).debug('Sky index unavailable: %s', exc)
 

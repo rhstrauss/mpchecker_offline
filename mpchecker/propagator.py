@@ -938,6 +938,62 @@ def oorb_ephemeris_multi_epoch(
     return result
 
 
+def oorb_ephemeris_multi_epoch_split(
+    orbits: np.ndarray,
+    t_mjd_list: list,
+    obscode: str,
+    a_arr: np.ndarray,
+    e_arr: np.ndarray,
+    dynmodel_nea: str = 'N',
+    dynmodel_mba: str = '2',
+    obscodes: dict = None,
+) -> np.ndarray:
+    """
+    As oorb_ephemeris_multi_epoch but uses separate dynamics models for
+    MBA-class vs NEO/high-e candidates.
+
+    MBA-class (q = a*(1-e) >= 1.3 AU AND e < 0.5): use dynmodel_mba ('2' by
+    default).  Two-body propagation is 10–100× faster in pyoorb for these
+    objects and introduces < 30 arcsec error over a 2-year element-epoch
+    drift — far below the 30-arcmin search radius.
+
+    NEO/high-e (q < 1.3 AU OR e >= 0.5): always use dynmodel_nea ('N' by
+    default), guaranteeing N-body accuracy for close-approach objects.
+
+    Returns [n_orbits, n_epochs, 11] with the two sub-batch results merged.
+    """
+    q      = a_arr * (1.0 - e_arr)
+    is_nea = (q < 1.3) | (e_arr >= 0.5)
+    n      = len(orbits)
+    n_ep   = len(t_mjd_list)
+
+    # Fast path: every orbit falls in the same class — single call, no split.
+    if is_nea.all():
+        return oorb_ephemeris_multi_epoch(
+            orbits, t_mjd_list, obscode, dynmodel_nea, obscodes=obscodes)
+    if not is_nea.any():
+        return oorb_ephemeris_multi_epoch(
+            orbits, t_mjd_list, obscode, dynmodel_mba, obscodes=obscodes)
+
+    mba_idx = np.where(~is_nea)[0]
+    nea_idx = np.where( is_nea)[0]
+
+    result = np.full((n, n_ep, 11), np.nan)
+    result[:, :, 9] = 99.0   # default vmag=99 (no result)
+
+    # Two-body call for MBA-class (fast)
+    r_mba = oorb_ephemeris_multi_epoch(
+        orbits[mba_idx], t_mjd_list, obscode, dynmodel_mba, obscodes=obscodes)
+    result[mba_idx] = r_mba
+
+    # N-body call for NEA/high-e (precise)
+    r_nea = oorb_ephemeris_multi_epoch(
+        orbits[nea_idx], t_mjd_list, obscode, dynmodel_nea, obscodes=obscodes)
+    result[nea_idx] = r_nea
+
+    return result
+
+
 # Proactive orbit batch cap — pyoorb error 35 observed at ~1800 orbits;
 # stay well below with headroom for future epoch-count interactions.
 _OORB_BATCH_MAX = 800
