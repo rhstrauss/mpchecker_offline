@@ -257,6 +257,120 @@ def format_identification_summary(
     return '\n'.join(lines)
 
 
+def format_results_csv(results, search_radius_arcmin: float) -> str:
+    """
+    Output matches as CSV (one row per observation × match).
+
+    Columns: designation, epoch_mjd, obs_ra_deg, obs_dec_deg, obscode,
+             name, packed, obj_type, sep_arcsec,
+             ra_rate_arcsec_hr, dec_rate_arcsec_hr,
+             match_ra_deg, match_dec_deg, r_au, delta_au, vmag,
+             phase_deg, orbit_quality
+    """
+    import csv, io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([
+        'designation', 'epoch_mjd', 'obs_ra_deg', 'obs_dec_deg', 'obscode',
+        'name', 'packed', 'obj_type',
+        'sep_arcsec', 'ra_rate_arcsec_hr', 'dec_rate_arcsec_hr',
+        'match_ra_deg', 'match_dec_deg',
+        'r_au', 'delta_au', 'vmag', 'phase_deg', 'orbit_quality',
+    ])
+    for res in results:
+        obs = res.obs
+        for m in res.matches:
+            w.writerow([
+                obs.designation or '',
+                round(obs.epoch_mjd, 6),
+                round(obs.ra_deg, 6),
+                round(obs.dec_deg, 6),
+                obs.obscode,
+                m.name, m.packed, m.obj_type,
+                round(m.sep_arcsec, 2),
+                round(m.ra_rate, 3),
+                round(m.dec_rate, 3),
+                round(m.ra_deg, 6),
+                round(m.dec_deg, 6),
+                round(m.r_helio, 5),
+                round(m.delta, 5),
+                round(m.vmag, 2),
+                round(m.phase_deg, 2),
+                m.orbit_quality,
+            ])
+    return buf.getvalue()
+
+
+def format_identifications_csv(
+    idents_by_desig: dict,
+    obs_by_desig: dict,
+) -> str:
+    """
+    Output identification results as CSV (one row per cluster).
+
+    Columns: designation, n_obs, n_nights, status, method, match_name,
+             rms_arcsec, fo_rms_arcsec, fo_n_obs, fo_earth_moid_au,
+             fo_a, fo_e, fo_i, fo_epoch_mjd,
+             catalog_match, catalog_match_score
+    """
+    import csv, io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([
+        'designation', 'n_obs', 'n_nights', 'status', 'method',
+        'match_name', 'rms_arcsec', 'fo_rms_arcsec', 'fo_n_obs',
+        'fo_earth_moid_au', 'fo_a', 'fo_e', 'fo_i', 'fo_epoch_mjd',
+        'catalog_match', 'catalog_match_score',
+    ])
+    for desig in sorted(obs_by_desig.keys()):
+        obs_list = obs_by_desig[desig]
+        n_obs_d  = len(obs_list)
+        n_nights = len(set(int(o.epoch_mjd) for o in obs_list))
+        idents   = idents_by_desig.get(desig, [])
+
+        if not idents:
+            w.writerow([desig, n_obs_d, n_nights,
+                        'NO_CANDIDATES', '', '', '', '', '', '',
+                        '', '', '', '', '', ''])
+            continue
+
+        best   = idents[0]
+        status = _ident_status(best, obs_list)
+        name   = _ident_display_name(best)
+        if name == 'unknown':
+            name = ''
+
+        rms    = (round(best.rms_arcsec, 3)
+                  if np.isfinite(best.rms_arcsec) else '')
+        fo_rms = (round(best.fo_rms_internal, 3)
+                  if best.fo_rms_internal is not None
+                  and np.isfinite(best.fo_rms_internal) else '')
+        fo_n   = best.fo_n_obs or ''
+        fo_moid = (round(best.fo_earth_moid_au, 5)
+                   if best.fo_earth_moid_au is not None
+                   and np.isfinite(best.fo_earth_moid_au) else '')
+
+        fo_a = fo_e = fo_i = fo_ep = ''
+        if best.fo_elements is not None:
+            el   = best.fo_elements
+            fo_a = round(float(el['a'][0]),     6)
+            fo_e = round(float(el['e'][0]),     6)
+            fo_i = round(float(el['i'][0]),     4)
+            fo_ep = round(float(el['epoch'][0]), 2)
+
+        cat_match = best.fo_catalog_name or ''
+        cat_score = (round(best.fo_catalog_score, 5)
+                     if best.fo_catalog_score is not None else '')
+
+        w.writerow([
+            desig, n_obs_d, n_nights, status, best.method,
+            name, rms, fo_rms, fo_n, fo_moid,
+            fo_a, fo_e, fo_i, fo_ep,
+            cat_match, cat_score,
+        ])
+    return buf.getvalue()
+
+
 def format_results_json(
     results,
     search_radius_arcmin: float,
@@ -613,6 +727,18 @@ def main(argv=None):
                         help='Output results as JSON (machine-readable) instead of text table. '
                              'When combined with --identify the JSON includes per-cluster '
                              'identification results and orbital elements.')
+    parser.add_argument('--csv', action='store_true',
+                        help='Output matches as CSV instead of text table '
+                             '(one row per observation × match). '
+                             'When combined with --identify, identification results are '
+                             'appended as a second CSV section after a blank line.')
+    parser.add_argument('--summary-only', action='store_true',
+                        help='Suppress per-observation match table and (with --identify) '
+                             'per-cluster identification detail. '
+                             'Prints only a compact count summary, or (with --identify) '
+                             'only the identification summary table. '
+                             'Compatible with --json (drops observations array) '
+                             'and --csv (drops matches rows).')
     parser.add_argument('--output', '-o', type=Path,
                         help='Write results to file instead of stdout')
     parser.add_argument('--verbose', '-v', action='store_true',
@@ -817,7 +943,24 @@ def main(argv=None):
             }
             results = query_daemon(observations, daemon_params)
             if results is not None:
-                output = format_results(results, args.radius)
+                n_with_m = sum(1 for r in results if r.matches)
+                tot_m    = sum(len(r.matches) for r in results)
+                if args.json:
+                    output = _json_mod.dumps(
+                        format_results_json(results, args.radius), indent=2)
+                    if args.summary_only:
+                        d = _json_mod.loads(output)
+                        d.pop('observations', None)
+                        output = _json_mod.dumps(d, indent=2)
+                elif args.csv:
+                    output = ('' if args.summary_only
+                              else format_results_csv(results, args.radius))
+                elif args.summary_only:
+                    output = (f'{len(results)} observation(s), '
+                              f'{n_with_m} with matches, '
+                              f'{tot_m} total match(es).')
+                else:
+                    output = format_results(results, args.radius)
                 if args.output:
                     with open(args.output, 'w') as f:
                         f.write(output + '\n')
@@ -980,31 +1123,94 @@ def main(argv=None):
 
         identification_output = ''.join(id_parts)
 
+    # -----------------------------------------------------------------------
     # Format and output
+    # -----------------------------------------------------------------------
     total_matches = sum(len(r.matches) for r in results)
+    n_with_matches = sum(1 for r in results if r.matches)
 
+    # Validate mutually-exclusive format flags
+    if args.json and args.csv:
+        print('ERROR: --json and --csv are mutually exclusive.', file=sys.stderr)
+        return 1
+
+    # Build the primary output string
     if args.json:
         json_dict = format_results_json(
             results, args.radius,
             identifications_by_desig=idents_by_desig if args.identify else None,
             obs_by_desig=obs_grp_by_desig if args.identify else None,
         )
+        if args.summary_only:
+            # Drop per-observation data; keep only meta + identifications
+            json_dict.pop('observations', None)
         output = _json_mod.dumps(json_dict, indent=2)
-    else:
-        output = format_results(results, args.radius)
 
+    elif args.csv:
+        if args.summary_only:
+            # Matches suppressed — only write identifications section (if any)
+            output = ''
+        else:
+            output = format_results_csv(results, args.radius)
+        if args.identify and idents_by_desig:
+            idents_csv = format_identifications_csv(
+                idents_by_desig, obs_grp_by_desig)
+            if output:
+                output = output.rstrip('\n') + '\n\n# identifications\n' + idents_csv
+            else:
+                output = '# identifications\n' + idents_csv
+
+    else:
+        # Plain text
+        if args.summary_only:
+            # Compact count line instead of full match table
+            output = (f'{len(results)} observation(s), '
+                      f'{n_with_matches} with matches, '
+                      f'{total_matches} total match(es).')
+        else:
+            output = format_results(results, args.radius)
+
+    # identification_output holds per-cluster detail + summary (text only)
+    # --summary-only suppresses per-cluster detail but keeps the summary table
+    if args.summary_only and not args.json and not args.csv:
+        # Re-build identification output to show only the summary table
+        if args.identify and obs_grp_by_desig:
+            if len(obs_grp_by_desig) > 1:
+                identification_output = format_identification_summary(
+                    idents_by_desig, obs_grp_by_desig)
+            else:
+                # Single tracklet: show status line instead of full detail
+                desig0    = next(iter(obs_grp_by_desig))
+                obs_list0 = obs_grp_by_desig[desig0]
+                idents0   = idents_by_desig.get(desig0, [])
+                if idents0:
+                    best   = idents0[0]
+                    status = _ident_status(best, obs_list0)
+                    name   = _ident_display_name(best)
+                    rms    = (f'{best.rms_arcsec:.2f}"'
+                              if np.isfinite(best.rms_arcsec) else '—')
+                    identification_output = (
+                        f'\n{status}: {name}  '
+                        f'[{best.method}]  RMS={rms}  '
+                        f'({len(obs_list0)} obs)')
+                else:
+                    identification_output = '\nNo identification found.'
+        else:
+            identification_output = ''
+
+    # Write output
     if args.output:
         with open(args.output, 'w') as f:
             f.write(output + '\n')
-            if not args.json and identification_output:
+            if not args.json and not args.csv and identification_output:
                 f.write(identification_output + '\n')
         print(f'Results written to {args.output}', file=sys.stderr)
     else:
         print(output)
-        if not args.json and identification_output:
+        if not args.json and not args.csv and identification_output:
             print(identification_output)
 
-    if total_matches == 0 and len(asteroids) > 0:
+    if total_matches == 0 and len(asteroids) > 0 and not args.summary_only:
         print('Hint: 0 matches found. Run with --debug for pipeline diagnostics.',
               file=sys.stderr)
 
