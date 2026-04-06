@@ -683,6 +683,10 @@ def main(argv=None):
                         help='Download/update orbit data and SPICE kernels')
     parser.add_argument('--build-index', action='store_true',
                         help='Build (or rebuild) the sky position index for fast lookup')
+    parser.add_argument('--build-bright-table', action='store_true',
+                        help='Build (or rebuild) the bright-object ephemeris table for fast Phase 2')
+    parser.add_argument('--bright-table', type=Path, metavar='FILE',
+                        help='Path to a pre-built bright ephemeris table (.npz)')
     parser.add_argument('--satellites-only', action='store_true',
                         help='(with --download-data) only download satellite data')
     parser.add_argument('--asteroids-only', action='store_true',
@@ -813,6 +817,24 @@ def main(argv=None):
         idx = get_or_build_index(asts, obscodes_bi, CACHE_DIR, force_rebuild=True)
         print(f'Index built (ref MJD {idx.t_ref_mjd:.1f}, valid {idx.validity_days:.0f} days).',
               file=sys.stderr)
+        return 0
+
+    # --build-bright-table mode
+    if args.build_bright_table:
+        from .mpcorb import load_mpcorb, load_obscodes
+        from .bright_table import BrightEphemTable
+        from .config import CACHE_DIR
+        from astropy.time import Time
+        import numpy as np
+        print('Loading asteroid catalog …', file=sys.stderr)
+        asts = load_mpcorb(H_limit=16.0)
+        obscodes_bt = load_obscodes()
+        t0 = Time.now().mjd
+        cache_path = CACHE_DIR / 'bright_table.npz'
+        print(f'Building bright table for {len(asts)} H≤16 objects → {cache_path} …',
+              file=sys.stderr)
+        BrightEphemTable.build(asts, obscodes_bt, t0, cache_path=cache_path)
+        print('Done.', file=sys.stderr)
         return 0
 
     # --download-data mode
@@ -1025,6 +1047,15 @@ def main(argv=None):
         except Exception as exc:
             print(f'WARNING: could not load MPCAT index: {exc}', file=sys.stderr)
 
+    # Load bright ephemeris table if requested
+    bright_table = None
+    if hasattr(args, 'bright_table') and args.bright_table:
+        try:
+            from .bright_table import BrightEphemTable
+            bright_table = BrightEphemTable.load(args.bright_table)
+        except Exception as exc:
+            logging.getLogger(__name__).warning('Could not load bright table: %s', exc)
+
     # Run checks
     from .checker import check_observations
     results = check_observations(
@@ -1042,6 +1073,7 @@ def main(argv=None):
         fo_refit_q_threshold=args.fo_refit_q,
         fo_epoch_window_days=args.fo_epoch_window,
         fo_progress=(args.verbose or args.debug),
+        bright_table=bright_table,
     )
 
     # Optional: tracklet identification (O-C residuals across all observations)

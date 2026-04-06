@@ -603,6 +603,7 @@ def _phase2_worker(group_item):
     obscodes      = st['obscodes']
 
     per_obs: dict = {i: [] for i in obs_indices}
+    bright_table = st.get('bright_table')
 
     # ---- Asteroids ----
     all_ast = sorted(set().union(
@@ -610,19 +611,40 @@ def _phase2_worker(group_item):
     if all_ast:
         all_ast_arr = np.array(all_ast, dtype=np.intp)
         sub = asteroids[all_ast_arr]
-        orbits = build_oorb_orbits_kep(
-            sub['a'], sub['e'],
-            sub['i']     * _DEG2RAD,
-            sub['Omega'] * _DEG2RAD,
-            sub['omega'] * _DEG2RAD,
-            sub['M']     * _DEG2RAD,
-            sub['epoch'], sub['H'], sub['G'],
-        )
+        n_all = len(sub)
         t_tts = [obs_meta[i]['t_tt'] for i in obs_indices]
-        eph_batch = oorb_ephemeris_multi_epoch_split(
-            orbits, t_tts, obscode,
-            a_arr=sub['a'], e_arr=sub['e'],
-            dynmodel_nea=dynmodel, obscodes=obscodes)
+        n_ep  = len(t_tts)
+
+        eph_batch    = np.full((n_all, n_ep, 11), np.nan)
+        eph_batch[:, :, 9] = 99.0
+        pyoorb_mask  = np.ones(n_all, dtype=bool)
+
+        if bright_table is not None:
+            obs_helio_list = [obs_meta[i]['obs_helio'] for i in obs_indices]
+            bt_valid, bt_eph = bright_table.get_eph(
+                all_ast_arr, t_tts, obs_helio_list, obscode, obscodes)
+            if bt_valid.any():
+                eph_batch[bt_valid] = bt_eph[bt_valid]
+                pyoorb_mask[bt_valid] = False
+                log.debug('Phase 2 worker %s: %d/%d served from bright table',
+                          obscode, int(bt_valid.sum()), n_all)
+
+        pyoorb_idx = np.where(pyoorb_mask)[0]
+        if len(pyoorb_idx) > 0:
+            sub_p  = sub[pyoorb_idx]
+            orbits = build_oorb_orbits_kep(
+                sub_p['a'], sub_p['e'],
+                sub_p['i']     * _DEG2RAD,
+                sub_p['Omega'] * _DEG2RAD,
+                sub_p['omega'] * _DEG2RAD,
+                sub_p['M']     * _DEG2RAD,
+                sub_p['epoch'], sub_p['H'], sub_p['G'],
+            )
+            eph_p = oorb_ephemeris_multi_epoch_split(
+                orbits, t_tts, obscode,
+                a_arr=sub_p['a'], e_arr=sub_p['e'],
+                dynmodel_nea=dynmodel, obscodes=obscodes)
+            eph_batch[pyoorb_idx] = eph_p
 
         for k, obs_i in enumerate(obs_indices):
             my_cands = obs_meta[obs_i]['ast_cands']
@@ -722,6 +744,7 @@ def check_observations(
     fo_epoch_window_days: float = 5.0,
     fo_progress: bool = False,
     asteroid_soa: Optional[AsteroidSOA] = None,
+    bright_table=None,
 ) -> List[CheckResult]:
     """
     Check each observation against the asteroid/comet catalogs and satellites.
@@ -885,6 +908,7 @@ def check_observations(
             'search_rad_deg': search_rad_deg,
             'mag_limit':     mag_limit,
             'obscodes':      obscodes,
+            'bright_table':  bright_table,
         }
         nw2 = min(n_workers, len(by_obscode))
         ctx2 = mp.get_context('fork')
@@ -901,19 +925,38 @@ def check_observations(
             if all_ast:
                 all_ast = np.array(all_ast, dtype=np.intp)
                 sub = asteroids[all_ast]
-                orbits = build_oorb_orbits_kep(
-                    sub['a'], sub['e'],
-                    sub['i']     * _DEG2RAD,
-                    sub['Omega'] * _DEG2RAD,
-                    sub['omega'] * _DEG2RAD,
-                    sub['M']     * _DEG2RAD,
-                    sub['epoch'], sub['H'], sub['G'],
-                )
+                n_all = len(sub)
                 t_tts = [obs_meta[i]['t_tt'] for i in obs_indices]
-                eph_batch = oorb_ephemeris_multi_epoch_split(
-                    orbits, t_tts, obscode,
-                    a_arr=sub['a'], e_arr=sub['e'],
-                    dynmodel_nea=dynmodel, obscodes=obscodes)
+                n_ep  = len(t_tts)
+
+                eph_batch   = np.full((n_all, n_ep, 11), np.nan)
+                eph_batch[:, :, 9] = 99.0
+                pyoorb_mask = np.ones(n_all, dtype=bool)
+
+                if bright_table is not None:
+                    obs_helio_list = [obs_meta[i]['obs_helio'] for i in obs_indices]
+                    bt_valid, bt_eph = bright_table.get_eph(
+                        all_ast, t_tts, obs_helio_list, obscode, obscodes)
+                    if bt_valid.any():
+                        eph_batch[bt_valid] = bt_eph[bt_valid]
+                        pyoorb_mask[bt_valid] = False
+
+                pyoorb_idx = np.where(pyoorb_mask)[0]
+                if len(pyoorb_idx) > 0:
+                    sub_p  = sub[pyoorb_idx]
+                    orbits = build_oorb_orbits_kep(
+                        sub_p['a'], sub_p['e'],
+                        sub_p['i']     * _DEG2RAD,
+                        sub_p['Omega'] * _DEG2RAD,
+                        sub_p['omega'] * _DEG2RAD,
+                        sub_p['M']     * _DEG2RAD,
+                        sub_p['epoch'], sub_p['H'], sub_p['G'],
+                    )
+                    eph_p = oorb_ephemeris_multi_epoch_split(
+                        orbits, t_tts, obscode,
+                        a_arr=sub_p['a'], e_arr=sub_p['e'],
+                        dynmodel_nea=dynmodel, obscodes=obscodes)
+                    eph_batch[pyoorb_idx] = eph_p
 
                 for k, obs_i in enumerate(obs_indices):
                     my_cands = obs_meta[obs_i]['ast_cands']
