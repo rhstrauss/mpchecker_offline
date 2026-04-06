@@ -1613,22 +1613,32 @@ def identify_tracklet(
             log.debug('identify_tracklet: fo fit failed: %s', exc)
 
     # Deduplicate: if a satellite identification and an orbit_fit identification
-    # refer to the same object (same match name), keep only the satellite entry.
-    # This avoids showing both [1] Carme [SPICE satellite] and [2] Carme [fo orbit fit]
-    # when the fo fit's anchor was set to the satellite match.
-    sat_names = {
-        ident.match.name
-        for ident in identifications
-        if ident.method == 'satellite' and ident.match is not None
-    }
-    if sat_names:
-        identifications = [
-            ident for ident in identifications
-            if not (
-                ident.method == 'orbit_fit'
-                and ident.match is not None
-                and ident.match.name in sat_names
-            )
-        ]
+    # refer to the same object (same match name), keep only the lower-RMS entry.
+    # SPICE RMS = ephemeris positional offset (can be large for irregular moons).
+    # fo_fit RMS = internal astrometric consistency of the observations.
+    # Whichever is lower is more informative about the tracklet quality.
+    by_name: dict = {}
+    for ident in identifications:
+        name = ident.match.name if ident.match is not None else None
+        if name is None:
+            continue
+        if name not in by_name:
+            by_name[name] = [ident]
+        else:
+            by_name[name].append(ident)
 
-    return identifications
+    seen: set = set()
+    deduped: List[Identification] = []
+    for ident in identifications:
+        name = ident.match.name if ident.match is not None else None
+        if name and len(by_name.get(name, [])) > 1:
+            if name not in seen:
+                best = min(by_name[name], key=lambda x: x.rms_arcsec)
+                deduped.append(best)
+                seen.add(name)
+        else:
+            deduped.append(ident)
+            if name:
+                seen.add(name)
+
+    return deduped
