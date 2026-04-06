@@ -1523,6 +1523,71 @@ def identify_tracklet(
                                 cat_name  = fo_desig
                                 cat_score = 0.0
 
+                        # Validate catalog match: confirm the catalog orbit actually
+                        # predicts the observed positions.  Element similarity alone
+                        # is insufficient — a short-arc fit to a planetary satellite's
+                        # apparent motion can yield heliocentric elements close to a
+                        # real asteroid at the same sky distance.  The satellite's
+                        # SPICE ephemeris is precise, but the heliocentric orbit fit
+                        # is an artefact of projecting a bound-satellite trajectory
+                        # onto a heliocentric conic.  Running the catalog orbit through
+                        # pyoorb exposes the true ~100" positional mismatch.
+                        if cat_name is not None and cat_packed:
+                            _cat_idx = np.where(
+                                (asteroids['packed'] == cat_packed) |
+                                (asteroids['desig']  == cat_packed)
+                            )[0]
+                            if len(_cat_idx):
+                                try:
+                                    _sub = asteroids[_cat_idx[:1]]
+                                    _cat_orb = build_oorb_orbits_kep(
+                                        _sub['a'], _sub['e'],
+                                        _sub['i']     * _DEG2RAD,
+                                        _sub['Omega'] * _DEG2RAD,
+                                        _sub['omega'] * _DEG2RAD,
+                                        _sub['M']     * _DEG2RAD,
+                                        _sub['epoch'], _sub['H'], _sub['G'],
+                                    )
+                                    _val_seps = []
+                                    for _obc, _oidxs in by_obscode.items():
+                                        _ettvs = [t_tts[_ii] for _ii in _oidxs]
+                                        try:
+                                            _eph_v = oorb_ephemeris_multi_epoch(
+                                                _cat_orb, _ettvs, _obc,
+                                                dynmodel, obscodes=obscodes)
+                                            for _k, _oi in enumerate(_oidxs):
+                                                _o = observations[_oi]
+                                                _ra  = float(_eph_v[0, _k, 1])
+                                                _dec = float(_eph_v[0, _k, 2])
+                                                if np.isfinite(_ra) and np.isfinite(_dec):
+                                                    _val_seps.append(
+                                                        ang_sep_deg(_ra, _dec,
+                                                                    _o.ra_deg,
+                                                                    _o.dec_deg) * 3600.0
+                                                    )
+                                        except Exception:
+                                            pass
+                                    if _val_seps:
+                                        _val_rms = float(np.sqrt(
+                                            np.mean(np.array(_val_seps) ** 2)))
+                                        _val_thr = max(10.0,
+                                                       5.0 * residual_threshold_arcsec)
+                                        if _val_rms > _val_thr:
+                                            log.info(
+                                                'identify_tracklet: catalog match %s '
+                                                'REJECTED — catalog orbit RMS=%.1f" '
+                                                'vs threshold=%.1f"; element similarity '
+                                                'was a false positive (degenerate short-arc fit)',
+                                                cat_name, _val_rms, _val_thr,
+                                            )
+                                            cat_name   = None
+                                            cat_packed = None
+                                            cat_score  = None
+                                except Exception as _exc:
+                                    log.debug(
+                                        'identify_tracklet: catalog orbit validation '
+                                        'failed for %s: %s', cat_name, _exc)
+
                         log.info(
                             'identify_tracklet: fo fit RMS=%.2f" (fo-internal)'
                             '  catalog match: %s (score=%.4f)',
