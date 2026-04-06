@@ -5,6 +5,7 @@ A local replication of the [MPC MPChecker service](https://www.minorplanetcenter
 **Extends the MPC service with:**
 - Planetary satellites (~100 bodies via JPL SPICE kernels)
 - Dwarf planet satellites (Dysnomia, Hi'iaka, Namaka, Weywot, Vanth, Xiangliu, Actaea, MK2 — Keplerian orbit model, no SPICE coverage available)
+- Tracklet identification (`--identify`): determines which catalog object explains a multi-observation tracklet, including satellite identification via SPICE
 - Persistent daemon mode for interactive use (eliminates ~10–15 s cold start)
 - Multi-snapshot KD-tree index for fast catalog pre-filtering (~5 ms/obs)
 - Parallel Phase 1 pre-filter for large observation batches
@@ -103,10 +104,31 @@ The 80-column format is the standard MPC astrometry format (see [MPC format docs
 mpchecker --ra 26.09 --dec -0.97 --epoch 2024-01-01 --obscode 568
 ```
 
+### Tracklet identification
+
+Given a file of observations all belonging to the same object (any designation), determine which catalog object they correspond to:
+
+```bash
+mpchecker --identify obs.txt
+```
+
+With independent orbit determination via find_orb (requires `fo` on PATH):
+
+```bash
+mpchecker --identify --fo-fit obs.txt
+```
+
+The identifier checks three methods in priority order:
+1. **SPICE satellite** — if the same satellite is the uniquely closest match across all observations (useful for planetary moon tracklets misidentified as new discoveries)
+2. **Catalog orbit** — pyoorb ephemeris residuals for known minor planets/comets
+3. **Orbit fit** — find_orb fits an independent orbit and matches by element similarity, then validates the catalog orbit actually predicts the correct positions
+
+When `--fo-fit` is used and both a SPICE match and an orbit fit agree on the same object, the result with the lower RMS is reported.
+
 ### Key options
 
 ```bash
-mpchecker obs.txt --radius 30         # search radius in arcsec (default: 30)
+mpchecker obs.txt --radius 30         # search radius in arcmin (default: 30)
 mpchecker obs.txt --maglim 22         # faint V-mag limit (default: 25)
 mpchecker obs.txt --dynmodel N        # N-body integration (default: two-body)
 mpchecker obs.txt --workers 8         # parallel Phase 1 over observations
@@ -136,7 +158,7 @@ The daemon auto-rebuilds the KD-tree index when it goes stale (~every 7 days).
 mpchecker --build-index
 ```
 
-The multi-snapshot KD-tree index (4 snapshots, 2-day intervals) is built automatically on first run and cached. Rebuild manually after updating the orbit catalog.
+The multi-snapshot KD-tree index (4 snapshots, 2-day intervals) is built automatically on first run and cached. It also rebuilds automatically when the asteroid catalog size changes (e.g. after a catalog refresh). Rebuild manually at any time with `--build-index`.
 
 ---
 
@@ -163,7 +185,8 @@ bash scripts/download_data.sh --asteroids-only
 # Clear the cached parsed catalog so it's rebuilt on next run
 rm "$MPCHECKER_DATA/cache/mpcorb_H35.npy" 2>/dev/null
 
-# Rebuild the KD-tree index
+# The KD-tree index rebuilds automatically on next run when it detects
+# the catalog size changed; or force an immediate rebuild:
 mpchecker --build-index
 ```
 
