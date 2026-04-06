@@ -1181,6 +1181,7 @@ def identify_tracklet(
     min_obs: Optional[int] = None,
     fo_fit: bool = False,
     fo_timeout_sec: int = 60,
+    satellite_threshold_arcsec: float = 120.0,
 ) -> List[Identification]:
     """
     Identify which catalog candidates explain all input observations as a tracklet.
@@ -1233,10 +1234,19 @@ def identify_tracklet(
     # ---- Count how many input observations each Phase 2 candidate appears in ----
     count:      Counter = Counter()
     best_match: dict    = {}
-    for res in results:
+    # Also count satellite (Phase 3 / SPICE) matches by name across observations
+    sat_count:   Counter = Counter()
+    sat_obs_map: dict    = {}   # sat_name -> {obs_i: Match}
+    for obs_i, res in enumerate(results):
         for m in res.matches:
             if m.obj_type == 'satellite':
-                continue   # satellites have no catalog orbit to test
+                sat_count[m.name] += 1
+                if m.name not in sat_obs_map:
+                    sat_obs_map[m.name] = {}
+                prior = sat_obs_map[m.name].get(obs_i)
+                if prior is None or m.sep_arcsec < prior.sep_arcsec:
+                    sat_obs_map[m.name][obs_i] = m
+                continue
             key = (m.packed, m.obj_type)
             count[key] += 1
             if key not in best_match or m.sep_arcsec < best_match[key].sep_arcsec:
@@ -1365,6 +1375,61 @@ def identify_tracklet(
                 )
 
     identifications.sort(key=lambda x: x.rms_arcsec)
+
+    # ---- Satellite identification via SPICE positional offsets ----
+    #
+    # Unlike minor planets/comets, SPICE positions for planetary satellites are
+    # computed directly (no pyoorb needed).  The per-observation separations
+    # stored in Match.sep_arcsec ARE the residuals.  For irregular satellites
+    # (e.g. Carme group) SPICE element uncertainty can be 10–100", so we use a
+    # separate, more generous threshold.
+    #
+    # A satellite is identified when:
+    #   1. It appears in >= threshold observations (within the search radius)
+    #   2. Its RMS separation is below satellite_threshold_arcsec
+    #   3. It is uniquely the closest satellite by a significant margin
+    #
+    sat_identifications: List[Identification] = []
+    if satellite_threshold_arcsec > 0 and sat_count:
+        # Find the minimum RMS among qualifying satellites to check uniqueness
+        qualifying_sats = [
+            name for name, cnt in sat_count.items() if cnt >= threshold
+        ]
+        sat_rms_map = {}
+        for sat_name in qualifying_sats:
+            obs_by_i = sat_obs_map[sat_name]
+            residuals = [obs_by_i[i].sep_arcsec if i in obs_by_i else np.inf
+                         for i in range(n_obs)]
+            finite = [r for r in residuals if np.isfinite(r)]
+            if not finite:
+                continue
+            rms = float(np.sqrt(np.mean(np.array(finite) ** 2)))
+            sat_rms_map[sat_name] = (rms, residuals)
+
+        if sat_rms_map:
+            sorted_sats = sorted(sat_rms_map.items(), key=lambda kv: kv[1][0])
+            best_sat_name, (best_rms, best_residuals) = sorted_sats[0]
+            second_rms = sorted_sats[1][1][0] if len(sorted_sats) > 1 else np.inf
+
+            # Accept if within threshold AND at least 3× closer than next satellite
+            if best_rms <= satellite_threshold_arcsec and best_rms * 3 < second_rms:
+                obs_by_i = sat_obs_map[best_sat_name]
+                best_m = min(obs_by_i.values(), key=lambda m: m.sep_arcsec)
+                sat_identifications.append(Identification(
+                    match=best_m,
+                    residuals=best_residuals,
+                    rms_arcsec=best_rms,
+                    n_obs=n_obs,
+                    method='satellite',
+                ))
+                log.info(
+                    'identify_tracklet: satellite match %s  RMS=%.1f"  '
+                    '(next closest=%.1f")',
+                    best_sat_name, best_rms, second_rms,
+                )
+
+    # Satellite identifications take priority: prepend before orbit-based results
+    identifications = sat_identifications + identifications
 
     # ---- fo orbit fit (optional): brute-force orbit from input observations ----
     if fo_fit:

@@ -92,7 +92,7 @@ def _ident_display_name(ident) -> str:
 
 def _ident_status(ident, obs_list) -> str:
     """Classify an Identification for summary display."""
-    if ident.method == 'ephemeris':
+    if ident.method in ('ephemeris', 'satellite'):
         return 'IDENTIFIED'
     # orbit_fit method
     if ident.fo_catalog_name or (ident.match is not None):
@@ -129,15 +129,21 @@ def format_identifications(identifications, observations,
         method_label = {
             'ephemeris':  'catalog orbit (pyoorb)',
             'orbit_fit':  'fo orbit fit',
+            'satellite':  'SPICE satellite',
         }.get(ident.method, ident.method)
 
         display_name = _ident_display_name(ident)
 
         # For orbit_fit: rms_arcsec is fo's own internal RMS (reliable).
         # Flag with † to distinguish from pyoorb O-C residuals.
+        # For satellite: rms_arcsec is the SPICE positional offset (‡).
+        sat_rms_note = False
         if ident.method == 'orbit_fit' and ident.fo_rms_internal is not None:
             rms_str = f'{ident.rms_arcsec:.2f}"†'
             fo_rms_note = True
+        elif ident.method == 'satellite':
+            rms_str = f'{ident.rms_arcsec:.2f}"‡'
+            sat_rms_note = True
         else:
             rms_str = f'{ident.rms_arcsec:.2f}"'
 
@@ -158,7 +164,13 @@ def format_identifications(identifications, observations,
                 last2 = '  '.join(
                     f'{r:.2f}"' if np.isfinite(r) else '—' for r in resids[-2:])
                 resid_str = f'{first6}  …  {last2}  (n={len(resids)})'
-            lines.append(f'     O-C per obs (pyoorb): {resid_str}')
+            resid_label = 'Sep per obs (SPICE)' if ident.method == 'satellite' else 'O-C per obs (pyoorb)'
+            lines.append(f'     {resid_label}: {resid_str}')
+        if sat_rms_note and m is not None:
+            lines.append(
+                f'     SPICE: V={m.vmag:.1f}  Δ={m.delta:.3f} AU'
+                f'  (‡ offset reflects SPICE ephemeris uncertainty for this satellite)'
+            )
         if ident.method == 'ephemeris' and m is not None:
             uq = f'  U={m.orbit_quality}' if m.orbit_quality else ''
             lines.append(

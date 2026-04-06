@@ -432,17 +432,26 @@ def get_or_build_index(
 
         if snaps:
             multi = MultiSkyIndex(snaps, snapshot_interval)
-            # Use covers() when a batch range is known, is_fresh() otherwise
-            if t_min_mjd is not None and t_max_mjd is not None:
-                cache_ok = multi.covers(t_min_mjd, t_max_mjd)
+            # Reject index if it was built from a different-sized catalog
+            index_n = len(snaps[0]._indexed_mask)
+            if index_n != len(asteroids):
+                log.info(
+                    'Cached index size %d != catalog size %d; rebuilding …',
+                    index_n, len(asteroids),
+                )
+                snaps = []
             else:
-                cache_ok = multi.is_fresh(t_now_mjd)
-            if cache_ok:
-                log.info('Using %d cached index snapshot(s) (nearest %.1f days away)',
-                         len(snaps),
-                         min(abs(s.t_ref_mjd - t_now_mjd) for s in snaps))
-                return multi
-            log.info('Cached index does not cover required range, rebuilding …')
+                # Use covers() when a batch range is known, is_fresh() otherwise
+                if t_min_mjd is not None and t_max_mjd is not None:
+                    cache_ok = multi.covers(t_min_mjd, t_max_mjd)
+                else:
+                    cache_ok = multi.is_fresh(t_now_mjd)
+                if cache_ok:
+                    log.info('Using %d cached index snapshot(s) (nearest %.1f days away)',
+                             len(snaps),
+                             min(abs(s.t_ref_mjd - t_now_mjd) for s in snaps))
+                    return multi
+                log.info('Cached index does not cover required range, rebuilding …')
 
         # Remove stale files before rebuild
         for npz in cache_dir.glob('sky_index_*.npz'):
