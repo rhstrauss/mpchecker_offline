@@ -281,7 +281,12 @@ def start_daemon_background(mag_limit: float = 25.0, n_workers: int = 1,
     # Second fork — grandchild is reparented to init, won't become zombie
     pid2 = os.fork()
     if pid2 > 0:
-        sys.exit(0)   # first child exits
+        # Use os._exit() here to skip Python atexit/finalizers.  The first
+        # child has already inherited NumPy/Numba thread pools; calling
+        # sys.exit() runs their cleanup code on shared resources and triggers
+        # SIGABRT in the parent.  os._exit() exits immediately without any
+        # Python-level teardown.
+        os._exit(0)
 
     # Grandchild: this IS the daemon process
     log_path = _log_path()
