@@ -1612,4 +1612,23 @@ def identify_tracklet(
         except Exception as exc:
             log.debug('identify_tracklet: fo fit failed: %s', exc)
 
+    # Deduplicate: if a satellite identification and an orbit_fit identification
+    # refer to the same object (same match name), keep only the satellite entry.
+    # This avoids showing both [1] Carme [SPICE satellite] and [2] Carme [fo orbit fit]
+    # when the fo fit's anchor was set to the satellite match.
+    sat_names = {
+        ident.match.name
+        for ident in identifications
+        if ident.method == 'satellite' and ident.match is not None
+    }
+    if sat_names:
+        identifications = [
+            ident for ident in identifications
+            if not (
+                ident.method == 'orbit_fit'
+                and ident.match is not None
+                and ident.match.name in sat_names
+            )
+        ]
+
     return identifications
