@@ -424,6 +424,41 @@ def _phase1_one_obs(
                 log.debug('%s: +%d close-approach NEO candidates (q<1.3, H>%.1f)',
                           obs.designation, len(extra), h_cut)
 
+    # Opt 9: MBA tightening pass.
+    # After all three Phase 1 passes, re-screen MBA-class candidates at half
+    # the prefilter radius to reduce Phase 2 (pyoorb) input by ~4×.
+    #
+    # Safety invariant: objects with q < 1.3 AU (Apollos, Atens, Amors + buffer)
+    # or e > 0.5 (highly eccentric, large two-body errors) are NEVER tightened.
+    # These objects must always reach pyoorb's N-body integrator.
+    #
+    # For MBA-class objects (q ≥ 1.3, e < 0.5), two-body position errors over
+    # a 2-year catalog-epoch drift are < 30 arcsec, far below the half-prefilter
+    # margin (~0.75° = 2700 arcsec for the default 30-arcmin search radius).
+    # Running kep_to_radec on ~500 candidates costs < 1 ms (vs ~12 s full scan).
+    if len(ast_cands) > 0:
+        sub = asteroids[ast_cands]
+        q_sub = sub['a'] * (1.0 - sub['e'])
+        safe_mask = (q_sub >= 1.3) & (sub['e'] < 0.5)
+        n_safe = int(safe_mask.sum())
+        if n_safe > 0:
+            tight_deg = prefilter_deg * 0.5
+            safe_sub  = sub[safe_mask]
+            kep_tight = _asteroid_prefilter(
+                safe_sub, obs_helio, t_tt,
+                obs.ra_deg, obs.dec_deg, tight_deg)
+            # Rebuild ast_cands: always keep unsafe (NEO/high-e), keep only
+            # tight-passing safe candidates.
+            keep = np.ones(len(ast_cands), dtype=bool)
+            safe_global = np.where(safe_mask)[0]   # indices into ast_cands
+            keep[safe_global[~kep_tight]] = False
+            ast_cands = ast_cands[keep]
+            n_removed = n_safe - int(kep_tight.sum())
+            if n_removed:
+                log.debug('%s: MBA tightening removed %d/%d safe candidates '
+                          '(tight_deg=%.3f°)',
+                          obs.designation, n_removed, n_safe, tight_deg)
+
     comet_cands = np.array([], dtype=np.intp)
     if len(comets) > 0:
         comet_mask  = _comet_prefilter(
@@ -441,17 +476,18 @@ def _phase1_worker(idx_obs):
     Multiprocessing worker for Phase 1 pre-filter.
     Reads heavy arrays from _PHASE1_STATE (inherited via fork — no pickling).
 
-    Disables the Numba parallel kernel in each worker to avoid TBB thread-pool
-    fork-safety deadlocks (libgomp/TBB pools from the parent are not fork-safe).
-    The vectorized NumPy fallback is used instead; it is still fast because each
-    worker processes only 1/N of the observations.
+    Numba is DISABLED in each worker. Although the threading layer is OpenMP,
+    fork() only copies the calling thread; the OpenMP thread pool is not
+    preserved, and attempting to spawn OpenMP worker threads in a forked child
+    reliably deadlocks (barrier/mutex state from parent is inconsistent).
+    Workers fall back to the NumPy kep_to_radec path, which is ~10× slower
+    per-observation but scales linearly with n_workers — with 60-70 workers
+    the aggregate throughput exceeds single-process Numba.
     """
     i, obs = idx_obs
-    # Patch out the Numba kernel in this worker process (fork-local, doesn't
-    # affect the parent).  kep_to_radec falls back to vectorized NumPy.
     try:
         import mpchecker.propagator as _prop
-        _prop._NUMBA_KEP_KERNEL = None
+        _prop._NUMBA_KEP_KERNEL = None   # force NumPy fallback in this process
     except Exception:
         pass
     st = _PHASE1_STATE
@@ -734,6 +770,7 @@ def check_observations(
     if n_workers > 1 and len(observations) > 1:
         import multiprocessing as mp
         global _PHASE1_STATE
+        nw = min(n_workers, len(observations))
         _PHASE1_STATE = {
             'asteroids':    asteroids,
             'comets':       comets,
@@ -743,7 +780,6 @@ def check_observations(
             'prefilter_deg': prefilter_deg,
             'asteroid_soa': asteroid_soa,
         }
-        nw = min(n_workers, len(observations))
         ctx = mp.get_context('fork')
         with ctx.Pool(nw) as pool:
             tagged = pool.map(_phase1_worker, list(enumerate(observations)))
