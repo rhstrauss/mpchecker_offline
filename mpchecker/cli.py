@@ -178,6 +178,16 @@ def format_identifications(identifications, observations,
                 f'r={m.r_helio:.3f} AU  Δ={m.delta:.3f} AU  phase={m.phase_deg:.1f}°'
                 f'{uq}'
             )
+        # MPC arc info: n_obs, arc span, how many input obs are new
+        if ident.mpc_n_obs is not None:
+            arc_str  = f'  arc {ident.mpc_arc}' if ident.mpc_arc else ''
+            last_str = f'  last obs {ident.mpc_last_obs}' if ident.mpc_last_obs else ''
+            if ident.mpc_n_new is not None:
+                new_str = (f'  → {ident.mpc_n_new} of your obs are new (arc extension)'
+                           if ident.mpc_n_new > 0 else '  → no new obs (within known arc)')
+            else:
+                new_str = ''
+            lines.append(f'     MPC: {ident.mpc_n_obs} obs{arc_str}{last_str}{new_str}')
         if ident.method == 'orbit_fit' and ident.fo_elements is not None:
             el = ident.fo_elements
             moid_str = (f'  Earth MOID={ident.fo_earth_moid_au:.4f} AU'

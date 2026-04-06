@@ -125,6 +125,10 @@ class Identification:
     fo_rms_internal:  Optional[float]      = None   # fo's own RMS (arcsec); reliable for close-approach objects
     fo_n_obs:         Optional[int]        = None   # observations used in fo fit
     fo_earth_moid_au: Optional[float]      = None   # Earth MOID from fo solution (AU)
+    mpc_n_obs:        Optional[int]        = None   # total MPC observations for this object
+    mpc_arc:          Optional[str]        = None   # arc string, e.g. "2002-2025"
+    mpc_last_obs:     Optional[str]        = None   # last MPC obs date (YYYYMMDD)
+    mpc_n_new:        Optional[int]        = None   # input obs newer than last MPC obs
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +139,52 @@ def _utc_to_tt_mjd(mjd_utc: float) -> float:
     """MJD UTC → MJD TT."""
     from astropy.time import Time
     return Time(mjd_utc, format='mjd', scale='utc').tt.mjd
+
+
+def _yyyymmdd_to_mjd(s: str) -> Optional[float]:
+    """Convert YYYYMMDD string (from MPCORB last_obs field) to MJD UTC."""
+    s = s.strip()
+    if len(s) != 8:
+        return None
+    try:
+        from astropy.time import Time
+        return Time(f'{s[:4]}-{s[4:6]}-{s[6:8]}', format='iso', scale='utc').mjd
+    except Exception:
+        return None
+
+
+def _attach_arc_info(
+    identifications: list,
+    observations: list,
+    asteroids: np.ndarray,
+) -> None:
+    """
+    Populate mpc_n_obs / mpc_arc / mpc_last_obs / mpc_n_new on each
+    Identification that resolves to a known minor planet.
+
+    Modifies identifications in-place.
+    """
+    for ident in identifications:
+        if ident.match is None or ident.match.obj_type != 'minor_planet':
+            continue
+        packed = ident.match.packed
+        idx = np.where(asteroids['packed'] == packed)[0]
+        if not len(idx):
+            continue
+        row = asteroids[idx[0]]
+        n_obs    = int(row['n_obs'])
+        arc      = str(row['arc']).strip()
+        last_obs = str(row['last_obs']).strip()
+        if n_obs == 0 and not arc:
+            continue
+        last_mjd = _yyyymmdd_to_mjd(last_obs)
+        n_new = (sum(1 for obs in observations if last_mjd is not None
+                     and obs.epoch_mjd > last_mjd)
+                 if last_mjd is not None else None)
+        ident.mpc_n_obs    = n_obs if n_obs > 0 else None
+        ident.mpc_arc      = arc   if arc else None
+        ident.mpc_last_obs = last_obs if last_obs else None
+        ident.mpc_n_new    = n_new
 
 
 def _utc_to_tt_mjd_vec(mjd_utc_iterable) -> np.ndarray:
@@ -1611,6 +1661,9 @@ def identify_tracklet(
                         ))
         except Exception as exc:
             log.debug('identify_tracklet: fo fit failed: %s', exc)
+
+    # Attach MPC arc info (n_obs, arc, last_obs, n_new) to minor planet matches
+    _attach_arc_info(identifications, observations, asteroids)
 
     # Deduplicate: if a satellite identification and an orbit_fit identification
     # refer to the same object (same match name), keep only the lower-RMS entry.

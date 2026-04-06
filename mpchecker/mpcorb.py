@@ -55,19 +55,24 @@ def unpack_epoch_mjd(s: str) -> float:
 # ---------------------------------------------------------------------------
 
 ASTEROID_DTYPE = np.dtype([
-    ('desig',   'U20'),   # readable designation
-    ('packed',  'U8'),    # packed designation (first 7 chars of MPCORB line)
-    ('a',       'f8'),    # semi-major axis (AU)
-    ('e',       'f8'),    # eccentricity
-    ('i',       'f8'),    # inclination (deg)
-    ('Omega',   'f8'),    # longitude of ascending node (deg)
-    ('omega',   'f8'),    # argument of perihelion (deg)
-    ('M',       'f8'),    # mean anomaly (deg)
-    ('epoch',   'f8'),    # epoch (MJD TT)
-    ('H',       'f8'),    # absolute magnitude
-    ('G',       'f8'),    # slope parameter
-    ('U',       'U1'),    # uncertainty parameter
+    ('desig',    'U20'),  # readable designation
+    ('packed',   'U8'),   # packed designation (first 7 chars of MPCORB line)
+    ('a',        'f8'),   # semi-major axis (AU)
+    ('e',        'f8'),   # eccentricity
+    ('i',        'f8'),   # inclination (deg)
+    ('Omega',    'f8'),   # longitude of ascending node (deg)
+    ('omega',    'f8'),   # argument of perihelion (deg)
+    ('M',        'f8'),   # mean anomaly (deg)
+    ('epoch',    'f8'),   # epoch (MJD TT)
+    ('H',        'f8'),   # absolute magnitude
+    ('G',        'f8'),   # slope parameter
+    ('U',        'U1'),   # uncertainty parameter
+    ('n_obs',    'i4'),   # number of MPC observations
+    ('arc',      'U12'),  # arc string, e.g. "2002-2025" or "4 days"
+    ('last_obs', 'U8'),   # date of last observation (YYYYMMDD)
 ])
+# Cache schema version — bump when ASTEROID_DTYPE fields change
+_CACHE_VERSION = 'v2'
 
 COMET_DTYPE = np.dtype([
     ('desig',   'U40'),   # readable designation
@@ -160,6 +165,18 @@ def parse_mpcorb_line(line: str) -> Optional[np.void]:
 
     U = line[105].strip() if len(line) > 105 else ''
 
+    # Number of observations (cols 118-122, 1-indexed → 117:122, 0-indexed)
+    try:
+        n_obs = int(line[117:122]) if line[117:122].strip() else 0
+    except (ValueError, IndexError):
+        n_obs = 0
+
+    # Arc string (cols 128-136, 1-indexed → 127:136, 0-indexed)
+    arc = line[127:136].strip() if len(line) > 136 else ''
+
+    # Date of last observation (cols 195-202, 1-indexed → 194:202, 0-indexed; YYYYMMDD)
+    last_obs = line[194:202].strip() if len(line) > 194 else ''
+
     # Readable designation: prefer number from cols 167-194 if present
     desig_long = line[166:194].strip() if len(line) > 166 else ''
     if desig_long:
@@ -168,18 +185,21 @@ def parse_mpcorb_line(line: str) -> Optional[np.void]:
         desig = _make_desig(packed)
 
     rec = np.zeros(1, dtype=ASTEROID_DTYPE)[0]
-    rec['desig']  = desig
-    rec['packed'] = packed
-    rec['a']      = a
-    rec['e']      = e
-    rec['i']      = i_deg
-    rec['Omega']  = Omega
-    rec['omega']  = omega
-    rec['M']      = M
-    rec['epoch']  = epoch
-    rec['H']      = H
-    rec['G']      = G
-    rec['U']      = U
+    rec['desig']    = desig
+    rec['packed']   = packed
+    rec['a']        = a
+    rec['e']        = e
+    rec['i']        = i_deg
+    rec['Omega']    = Omega
+    rec['omega']    = omega
+    rec['M']        = M
+    rec['epoch']    = epoch
+    rec['H']        = H
+    rec['G']        = G
+    rec['U']        = U
+    rec['n_obs']    = n_obs
+    rec['arc']      = arc
+    rec['last_obs'] = last_obs
     return rec
 
 
@@ -195,7 +215,7 @@ def load_mpcorb(path: Optional[Path] = None,
     if path is None:
         path = MPCORB_FILE if MPCORB_FILE.exists() else MPCORB_GZ
 
-    cache_file = CACHE_DIR / f'mpcorb_H{int(H_limit)}.npy'
+    cache_file = CACHE_DIR / f'mpcorb_H{int(H_limit)}_{_CACHE_VERSION}.npy'
     if cache and cache_file.exists():
         src_mtime = path.stat().st_mtime if path.exists() else 0
         if cache_file.stat().st_mtime > src_mtime:
